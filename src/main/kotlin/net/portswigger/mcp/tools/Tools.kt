@@ -35,11 +35,7 @@ private suspend fun checkHistoryPermissionOrDeny(
 }
 
 private fun truncateIfNeeded(serialized: String): String {
-    return if (serialized.length > 5000) {
-        serialized.substring(0, 5000) + "... (truncated)"
-    } else {
-        serialized
-    }
+    return serialized
 }
 
 fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
