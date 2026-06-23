@@ -130,6 +130,7 @@ class ToolsKtTest {
     
     @BeforeEach
     fun setup() {
+        RepeaterCaptureStore.lastCapturedItem = null
         setupHttpHeaderMocks()
 
         serverManager.start(config) { state ->
@@ -153,6 +154,7 @@ class ToolsKtTest {
 
     @AfterEach
     fun tearDown() {
+        RepeaterCaptureStore.lastCapturedItem = null
         runBlocking { if (client.isConnected()) client.close() }
         serverManager.stop {}
     }
@@ -624,6 +626,35 @@ class ToolsKtTest {
                 
                 delay(100)
                 result.expectTextContent("Editor content")
+            }
+        }
+
+        @Test
+        fun `get captured repeater item should handle no captured item`() {
+            runBlocking {
+                val result = client.callTool("get_captured_repeater_item", emptyMap())
+
+                delay(100)
+                result.expectTextContent("<No captured Repeater item>")
+            }
+        }
+
+        @Test
+        fun `get captured repeater item should return captured request and response`() {
+            RepeaterCaptureStore.lastCapturedItem = CapturedRepeaterItem(
+                request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                response = "HTTP/1.1 200 OK\r\n\r\nok",
+                capturedAt = "2026-06-13T00:00:00Z"
+            )
+
+            runBlocking {
+                val result = client.callTool("get_captured_repeater_item", emptyMap())
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"request\":\"GET / HTTP/1.1"))
+                assertTrue(text.contains("\"response\":\"HTTP/1.1 200 OK"))
+                assertTrue(text.contains("\"capturedAt\":\"2026-06-13T00:00:00Z\""))
             }
         }
         

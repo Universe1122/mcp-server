@@ -296,6 +296,10 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         getActiveEditor(api)?.text ?: "<No active editor>"
     }
 
+    mcpTool("get_captured_repeater_item", "Returns the last Repeater request/response captured by the user") {
+        RepeaterCaptureStore.lastCapturedItem?.let { Json.encodeToString(it) } ?: "<No captured Repeater item>"
+    }
+
     mcpTool<SetActiveEditorContents>("Sets the content of the user's active message editor") {
         val editor = getActiveEditor(api) ?: return@mcpTool "<No active editor>"
 
