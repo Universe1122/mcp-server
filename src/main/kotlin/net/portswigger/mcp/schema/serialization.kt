@@ -44,6 +44,64 @@ fun burp.api.montoya.http.message.HttpRequestResponse.toSerializableForm(): Http
     )
 }
 
+fun burp.api.montoya.http.message.HttpRequestResponse.toSiteMapEntry(): SiteMapEntry {
+    val req = request()
+    val res = response()
+    return SiteMapEntry(
+        method = req?.method(),
+        url = req?.url(),
+        host = httpService()?.host(),
+        statusCode = res?.statusCode()?.toInt(),
+        responseLength = res?.body()?.length(),
+        mimeType = res?.statedMimeType()?.name,
+        hasParams = req?.parameters()?.isNotEmpty() ?: false,
+        notes = annotations().notes()
+    )
+}
+
+fun buildSiteMapTree(
+    items: List<burp.api.montoya.http.message.HttpRequestResponse>
+): Map<String, SiteMapTreeNode> {
+    class MutableNode {
+        val entries = mutableListOf<SiteMapEntry>()
+        val children = mutableMapOf<String, MutableNode>()
+        fun toImmutable(): SiteMapTreeNode = SiteMapTreeNode(
+            entries = entries.toList(),
+            children = children.toSortedMap().mapValues { it.value.toImmutable() }
+        )
+    }
+
+    val byHost = sortedMapOf<String, MutableNode>()
+    for (item in items) {
+        val req = item.request() ?: continue
+        val res = item.response() ?: continue
+        if (res.statusCode().toInt() == 0) continue
+        val service = item.httpService() ?: continue
+        val scheme = if (service.secure()) "https" else "http"
+        val port = service.port()
+        val defaultPort = (scheme == "http" && port == 80) || (scheme == "https" && port == 443)
+        val hostKey = "$scheme://${service.host()}${if (defaultPort) "" else ":$port"}"
+
+        val hostNode = byHost.getOrPut(hostKey) { MutableNode() }
+
+        val rawPath = try {
+            val url = req.url() ?: ""
+            java.net.URI(url).rawPath ?: ""
+        } catch (_: Exception) {
+            req.pathWithoutQuery() ?: ""
+        }
+        val segments = rawPath.split("/").filter { it.isNotEmpty() }
+
+        var current = hostNode
+        for (seg in segments) {
+            current = current.children.getOrPut(seg) { MutableNode() }
+        }
+        current.entries.add(item.toSiteMapEntry())
+    }
+
+    return byHost.mapValues { it.value.toImmutable() }
+}
+
 fun ProxyHttpRequestResponse.toSerializableForm(): HttpRequestResponse {
     return HttpRequestResponse(
         request = request()?.toString() ?: "<no request>",
@@ -106,6 +164,24 @@ data class HttpRequestResponse(
     val request: String?,
     val response: String?,
     val notes: String?
+)
+
+@Serializable
+data class SiteMapEntry(
+    val method: String?,
+    val url: String?,
+    val host: String?,
+    val statusCode: Int?,
+    val responseLength: Int?,
+    val mimeType: String?,
+    val hasParams: Boolean,
+    val notes: String?
+)
+
+@Serializable
+data class SiteMapTreeNode(
+    val entries: List<SiteMapEntry> = emptyList(),
+    val children: Map<String, SiteMapTreeNode> = emptyMap()
 )
 
 @Serializable

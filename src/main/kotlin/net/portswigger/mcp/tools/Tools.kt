@@ -9,11 +9,13 @@ import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpHeader
 import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.sitemap.SiteMapFilter
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import net.portswigger.mcp.config.McpConfig
+import net.portswigger.mcp.schema.buildSiteMapTree
 import net.portswigger.mcp.schema.toSerializableForm
 import net.portswigger.mcp.security.HistoryAccessSecurity
 import net.portswigger.mcp.security.HistoryAccessType
@@ -227,6 +229,26 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         }
     }
 
+    mcpTool<GetSiteMap>(
+        "Returns the Burp site map as a tree (mirroring Target > Site map). " +
+                "Top-level keys are \"scheme://host[:port]\"; each node has optional \"entries\" " +
+                "(requests recorded at that exact path) and \"children\" (sub-path segments). " +
+                "Each entry contains method, URL, host, status code, response length, MIME type, " +
+                "params flag, and notes. " +
+                "Optionally filter by URL prefix (e.g. \"https://example.com\") to limit the tree " +
+                "to a specific scheme/host/path. " +
+                "Montoya's API only exposes a flat List<HttpRequestResponse> via siteMap().requestResponses(); " +
+                "the tree is reconstructed from each item's URL."
+    ) {
+        val items = if (urlPrefix.isNullOrBlank()) {
+            api.siteMap().requestResponses()
+        } else {
+            api.siteMap().requestResponses(SiteMapFilter.prefixFilter(urlPrefix))
+        }
+        val tree = buildSiteMapTree(items)
+        Json.encodeToString(tree)
+    }
+
     mcpPaginatedTool<GetProxyHttpHistory>("Displays items within the proxy HTTP history") {
         val allowed = runBlocking {
             checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history")
@@ -404,6 +426,11 @@ data class SetActiveEditorContents(val text: String)
 
 @Serializable
 data class GetScannerIssues(override val count: Int, override val offset: Int) : Paginated
+
+@Serializable
+data class GetSiteMap(
+    val urlPrefix: String? = null
+)
 
 @Serializable
 data class GetProxyHttpHistory(override val count: Int, override val offset: Int) : Paginated

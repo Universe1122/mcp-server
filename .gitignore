@@ -40,3 +40,8 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+.claude
+.claude-docker-home
+.mcp.json
+.idea
