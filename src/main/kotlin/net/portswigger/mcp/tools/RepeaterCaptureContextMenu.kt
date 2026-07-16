@@ -11,19 +11,20 @@ import java.awt.Toolkit
 import java.awt.event.InputEvent
 import java.awt.event.KeyEvent
 import java.time.Instant
+import javax.swing.JMenu
 import javax.swing.JMenuItem
 import javax.swing.KeyStroke
 
 private const val CAPTURE_MENU_LABEL = "Capture Repeater item for MCP"
 
-// On macOS Burp maps "Ctrl" in a hotkey to the Command (⌘) key, so this binds to ⌘+Shift+S.
-private const val CAPTURE_HOTKEY = "Ctrl+Shift+S"
+// On macOS Burp maps "Ctrl" in a hotkey to the Command (⌘) key, so slot N binds to ⌘+Shift+N.
+private fun captureHotKey(slot: Int): String = "Ctrl+Shift+$slot"
 
-// Display-only accelerator shown on the context menu item. Using the platform menu-shortcut
-// mask keeps the hint consistent with Burp's "Ctrl" mapping: ⌘⇧S on macOS, Ctrl+Shift+S elsewhere.
-private val CAPTURE_ACCELERATOR: KeyStroke =
+// Display-only accelerator shown on each context menu item. Using the platform menu-shortcut
+// mask keeps the hint consistent with Burp's "Ctrl" mapping: ⌘⇧N on macOS, Ctrl+Shift+N elsewhere.
+private fun captureAccelerator(slot: Int): KeyStroke =
     KeyStroke.getKeyStroke(
-        KeyEvent.VK_S,
+        KeyEvent.VK_0 + slot,
         Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx or InputEvent.SHIFT_DOWN_MASK
     )
 
@@ -34,46 +35,55 @@ fun registerRepeaterCaptureContextMenu(api: MontoyaApi) {
                 return emptyList()
             }
 
-            val menuItem = JMenuItem(CAPTURE_MENU_LABEL)
-            menuItem.accelerator = CAPTURE_ACCELERATOR
-            menuItem.addActionListener {
-                val requestResponse = event.messageEditorRequestResponse().orElse(null)?.requestResponse()
-                    ?: event.selectedRequestResponses().firstOrNull()
+            val menu = JMenu(CAPTURE_MENU_LABEL)
 
-                captureRepeaterItem(api, requestResponse)
+            for (slot in 1..RepeaterCaptureStore.SLOT_COUNT) {
+                val menuItem = JMenuItem("Slot $slot")
+                menuItem.accelerator = captureAccelerator(slot)
+                menuItem.addActionListener {
+                    val requestResponse = event.messageEditorRequestResponse().orElse(null)?.requestResponse()
+                        ?: event.selectedRequestResponses().firstOrNull()
+
+                    captureRepeaterItem(api, slot, requestResponse)
+                }
+                menu.add(menuItem)
             }
 
-            return listOf(menuItem)
+            return listOf(menu)
         }
     })
 }
 
-fun registerRepeaterCaptureHotKey(api: MontoyaApi) {
-    api.userInterface().registerHotKeyHandler(
-        HotKeyContext.HTTP_MESSAGE_EDITOR,
-        CAPTURE_HOTKEY
-    ) { event ->
-        if (!event.isFromTool(ToolType.REPEATER)) {
-            return@registerHotKeyHandler
+fun registerRepeaterCaptureHotKeys(api: MontoyaApi) {
+    for (slot in 1..RepeaterCaptureStore.SLOT_COUNT) {
+        api.userInterface().registerHotKeyHandler(
+            HotKeyContext.HTTP_MESSAGE_EDITOR,
+            captureHotKey(slot)
+        ) { event ->
+            if (!event.isFromTool(ToolType.REPEATER)) {
+                return@registerHotKeyHandler
+            }
+
+            val requestResponse = event.messageEditorRequestResponse().orElse(null)?.requestResponse()
+
+            captureRepeaterItem(api, slot, requestResponse)
         }
-
-        val requestResponse = event.messageEditorRequestResponse().orElse(null)?.requestResponse()
-
-        captureRepeaterItem(api, requestResponse)
     }
 }
 
-private fun captureRepeaterItem(api: MontoyaApi, requestResponse: HttpRequestResponse?) {
+private fun captureRepeaterItem(api: MontoyaApi, slot: Int, requestResponse: HttpRequestResponse?) {
     if (requestResponse == null) {
         api.logging().logToOutput("No Repeater request/response available to capture")
         return
     }
 
-    RepeaterCaptureStore.lastCapturedItem = CapturedRepeaterItem(
-        request = requestResponse.request()?.toString(),
-        response = requestResponse.response()?.toString(),
-        capturedAt = Instant.now().toString()
+    RepeaterCaptureStore.set(
+        slot, CapturedRepeaterItem(
+            request = requestResponse.request()?.toString(),
+            response = requestResponse.response()?.toString(),
+            capturedAt = Instant.now().toString()
+        )
     )
 
-    api.logging().logToOutput("Captured Repeater item for MCP")
+    api.logging().logToOutput("Captured Repeater item for MCP slot $slot")
 }

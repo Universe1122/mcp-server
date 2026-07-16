@@ -318,8 +318,20 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         getActiveEditor(api)?.text ?: "<No active editor>"
     }
 
-    mcpTool("get_captured_repeater_item", "Returns the last Repeater request/response captured by the user") {
-        RepeaterCaptureStore.lastCapturedItem?.let { Json.encodeToString(it) } ?: "<No captured Repeater item>"
+    mcpTool<GetCapturedRepeaterItem>(
+        "Returns Repeater request/response items captured by the user. There are ${RepeaterCaptureStore.SLOT_COUNT} capture slots. " +
+                "Provide 'slot' (1-${RepeaterCaptureStore.SLOT_COUNT}) to return a specific slot, or omit it to return all captured slots."
+    ) {
+        if (slot != null) {
+            if (!RepeaterCaptureStore.isValidSlot(slot)) {
+                return@mcpTool "<Invalid slot: must be between 1 and ${RepeaterCaptureStore.SLOT_COUNT}>"
+            }
+            RepeaterCaptureStore.get(slot)?.let { Json.encodeToString(it) }
+                ?: "<No captured Repeater item in slot $slot>"
+        } else {
+            val captured = RepeaterCaptureStore.all()
+            if (captured.isEmpty()) "<No captured Repeater items>" else Json.encodeToString(captured)
+        }
     }
 
     mcpTool<SetActiveEditorContents>("Sets the content of the user's active message editor") {
@@ -423,6 +435,9 @@ data class SetProxyInterceptState(val intercepting: Boolean)
 
 @Serializable
 data class SetActiveEditorContents(val text: String)
+
+@Serializable
+data class GetCapturedRepeaterItem(val slot: Int? = null)
 
 @Serializable
 data class GetScannerIssues(override val count: Int, override val offset: Int) : Paginated

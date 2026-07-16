@@ -8,7 +8,7 @@ import net.portswigger.mcp.providers.ClaudeDesktopProvider
 import net.portswigger.mcp.providers.ManualProxyInstallerProvider
 import net.portswigger.mcp.providers.ProxyJarManager
 import net.portswigger.mcp.tools.registerRepeaterCaptureContextMenu
-import net.portswigger.mcp.tools.registerRepeaterCaptureHotKey
+import net.portswigger.mcp.tools.registerRepeaterCaptureHotKeys
 
 @Suppress("unused")
 class ExtensionBase : BurpExtension {
@@ -16,7 +16,7 @@ class ExtensionBase : BurpExtension {
     override fun initialize(api: MontoyaApi) {
         api.extension().setName("Burp MCP Server")
         registerRepeaterCaptureContextMenu(api)
-        registerRepeaterCaptureHotKey(api)
+        registerRepeaterCaptureHotKeys(api)
 
         val config = McpConfig(api.persistence().extensionData(), api.logging())
         val serverManager = KtorServerManager(api)

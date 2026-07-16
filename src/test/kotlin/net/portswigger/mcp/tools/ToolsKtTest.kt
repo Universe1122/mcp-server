@@ -130,7 +130,7 @@ class ToolsKtTest {
     
     @BeforeEach
     fun setup() {
-        RepeaterCaptureStore.lastCapturedItem = null
+        RepeaterCaptureStore.clear()
         setupHttpHeaderMocks()
 
         serverManager.start(config) { state ->
@@ -154,7 +154,7 @@ class ToolsKtTest {
 
     @AfterEach
     fun tearDown() {
-        RepeaterCaptureStore.lastCapturedItem = null
+        RepeaterCaptureStore.clear()
         runBlocking { if (client.isConnected()) client.close() }
         serverManager.stop {}
     }
@@ -630,21 +630,23 @@ class ToolsKtTest {
         }
 
         @Test
-        fun `get captured repeater item should handle no captured item`() {
+        fun `get captured repeater item should handle no captured items`() {
             runBlocking {
                 val result = client.callTool("get_captured_repeater_item", emptyMap())
 
                 delay(100)
-                result.expectTextContent("<No captured Repeater item>")
+                result.expectTextContent("<No captured Repeater items>")
             }
         }
 
         @Test
-        fun `get captured repeater item should return captured request and response`() {
-            RepeaterCaptureStore.lastCapturedItem = CapturedRepeaterItem(
-                request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-                response = "HTTP/1.1 200 OK\r\n\r\nok",
-                capturedAt = "2026-06-13T00:00:00Z"
+        fun `get captured repeater item should return all captured slots when no slot given`() {
+            RepeaterCaptureStore.set(
+                1, CapturedRepeaterItem(
+                    request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                    response = "HTTP/1.1 200 OK\r\n\r\nok",
+                    capturedAt = "2026-06-13T00:00:00Z"
+                )
             )
 
             runBlocking {
@@ -652,9 +654,50 @@ class ToolsKtTest {
 
                 delay(100)
                 val text = result.expectTextContent()
+                assertTrue(text.contains("\"slot\":1"))
                 assertTrue(text.contains("\"request\":\"GET / HTTP/1.1"))
                 assertTrue(text.contains("\"response\":\"HTTP/1.1 200 OK"))
                 assertTrue(text.contains("\"capturedAt\":\"2026-06-13T00:00:00Z\""))
+            }
+        }
+
+        @Test
+        fun `get captured repeater item should return the requested slot`() {
+            RepeaterCaptureStore.set(
+                2, CapturedRepeaterItem(
+                    request = "GET /two HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                    response = "HTTP/1.1 200 OK\r\n\r\ntwo",
+                    capturedAt = "2026-06-13T00:00:00Z"
+                )
+            )
+
+            runBlocking {
+                val result = client.callTool("get_captured_repeater_item", mapOf("slot" to 2))
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"request\":\"GET /two HTTP/1.1"))
+                assertTrue(text.contains("\"response\":\"HTTP/1.1 200 OK"))
+            }
+        }
+
+        @Test
+        fun `get captured repeater item should report empty slot`() {
+            runBlocking {
+                val result = client.callTool("get_captured_repeater_item", mapOf("slot" to 3))
+
+                delay(100)
+                result.expectTextContent("<No captured Repeater item in slot 3>")
+            }
+        }
+
+        @Test
+        fun `get captured repeater item should reject an invalid slot`() {
+            runBlocking {
+                val result = client.callTool("get_captured_repeater_item", mapOf("slot" to 9))
+
+                delay(100)
+                result.expectTextContent("<Invalid slot: must be between 1 and 3>")
             }
         }
         
