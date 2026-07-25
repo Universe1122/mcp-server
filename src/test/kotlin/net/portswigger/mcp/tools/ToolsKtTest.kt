@@ -10,6 +10,7 @@ import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpProtocol
 import burp.api.montoya.http.message.HttpHeader
 import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.logging.Logging
 import burp.api.montoya.persistence.PersistedObject
 import burp.api.montoya.proxy.Proxy
@@ -164,8 +165,10 @@ class ToolsKtTest {
         @Test
         fun `http1 line endings should be normalized`() {
             val httpService = mockk<Http>()
-            val httpResponse = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
+            val requestResponse = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
+            val httpResponse = mockk<HttpResponse>()
             val contentSlot = slot<String>()
+            val rawResponse = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nResponse body"
 
             every { HttpRequest.httpRequest(any(), capture(contentSlot)) } answers {
                 val content = secondArg<String>()
@@ -174,8 +177,9 @@ class ToolsKtTest {
                 }
             }
             every { api.http() } returns httpService
-            every { httpResponse.toString() } returns "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nResponse body"
-            every { httpService.sendRequest(capture(capturedRequest)) } returns httpResponse
+            every { requestResponse.response() } returns httpResponse
+            every { httpResponse.toString() } returns rawResponse
+            every { httpService.sendRequest(capture(capturedRequest)) } returns requestResponse
 
             runBlocking {
                 val result = client.callTool(
@@ -189,8 +193,7 @@ class ToolsKtTest {
 
                 delay(100)
                 val text = result.expectTextContent()
-                assertFalse(text.contains("Error"), 
-                    "Expected success response but got error: $text")
+                assertEquals(rawResponse, text)
             }
 
             verify(exactly = 1) { httpService.sendRequest(any<HttpRequest>()) }

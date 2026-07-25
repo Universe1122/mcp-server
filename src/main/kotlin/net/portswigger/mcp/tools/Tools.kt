@@ -56,9 +56,9 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         val fixedContent = content.replace("\r", "").replace("\n", "\r\n")
 
         val request = HttpRequest.httpRequest(toMontoyaService(), fixedContent)
-        val response = api.http().sendRequest(request)
+        val requestResponse = api.http().sendRequest(request)
 
-        response?.toString() ?: "<no response>"
+        requestResponse?.response()?.toString() ?: "<no response>"
     }
 
     mcpTool<SendHttp2Request>("Issues an HTTP/2 request and returns the response. Do NOT pass headers to the body parameter.") {
