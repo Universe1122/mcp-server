@@ -9,6 +9,8 @@ import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpHeader
 import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.proxy.ProxyHttpRequestResponse
+import burp.api.montoya.proxy.ProxyWebSocketMessage
 import burp.api.montoya.sitemap.SiteMapFilter
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.coroutines.runBlocking
@@ -34,6 +36,23 @@ private suspend fun checkHistoryPermissionOrDeny(
     }
     api.logging().logToOutput("MCP $logMessage access granted")
     return true
+}
+
+private class HistoryAccessDeniedException(historyName: String) :
+    Exception("$historyName access denied by Burp Suite")
+
+/**
+ * 거부를 예외로 올린다. mcpTool 의 try/catch 가 isError = true 로 바꿔 준다.
+ *
+ * 페이징 도구가 원소 타입 그대로(List<ProxyHttpRequestResponse> 등)를 반환하게 되면서,
+ * 거부 메시지를 결과 시퀀스에 끼워 넣던 기존 방식(sequenceOf("... denied ...")) 은
+ * 타입이 맞지 않아 쓸 수 없다.
+ */
+private fun requireHistoryAccess(
+    accessType: HistoryAccessType, config: McpConfig, api: MontoyaApi, logMessage: String
+) {
+    val allowed = runBlocking { checkHistoryPermissionOrDeny(accessType, config, api, logMessage) }
+    if (!allowed) throw HistoryAccessDeniedException(logMessage)
 }
 
 private fun truncateIfNeeded(serialized: String): String {
@@ -249,53 +268,63 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         Json.encodeToString(tree)
     }
 
-    mcpPaginatedTool<GetProxyHttpHistory>("Displays items within the proxy HTTP history") {
+    // 아래 히스토리 도구들은 원소를 그대로 반환하고 직렬화는 mapper 에 맡긴다.
+    // Sequence 오버로드는 map 이 붙은 뒤에 drop(offset) 을 걸어서, 버려지는 offset 구간의
+    // 메시지까지 전부 문자열로 물린 다음 폐기했다. List 오버로드는 subList 로 먼저 자르고
+    // transform 을 적용하므로, 실제로 반환되는 count 개만 직렬화된다.
+    mcpPaginatedTool<GetProxyHttpHistory, ProxyHttpRequestResponse>(
+        "Displays items within the proxy HTTP history",
+        mapper = { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+    ) {
+        requireHistoryAccess(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history")
+
+        api.proxy().history()
+    }
+
+    mcpTool(
+        "get_proxy_http_history_size",
+        "Returns the number of items currently in the proxy HTTP history. " +
+                "Cheap compared to get_proxy_http_history because message bodies are never read. " +
+                "Poll this to detect whether new items arrived before fetching a page."
+    ) {
         val allowed = runBlocking {
             checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history")
         }
-        if (!allowed) {
-            return@mcpPaginatedTool sequenceOf("HTTP history access denied by Burp Suite")
-        }
 
-        api.proxy().history().asSequence().map { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        if (!allowed) {
+            "HTTP history access denied by Burp Suite"
+        } else {
+            api.proxy().history().size.toString()
+        }
     }
 
-    mcpPaginatedTool<GetProxyHttpHistoryRegex>("Displays items matching a specified regex within the proxy HTTP history") {
-        val allowed = runBlocking {
-            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history")
-        }
-        if (!allowed) {
-            return@mcpPaginatedTool sequenceOf("HTTP history access denied by Burp Suite")
-        }
+    mcpPaginatedTool<GetProxyHttpHistoryRegex, ProxyHttpRequestResponse>(
+        "Displays items matching a specified regex within the proxy HTTP history",
+        mapper = { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+    ) {
+        requireHistoryAccess(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history")
 
         val compiledRegex = Pattern.compile(regex)
-        api.proxy().history { it.contains(compiledRegex) }.asSequence()
-            .map { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        api.proxy().history { it.contains(compiledRegex) }
     }
 
-    mcpPaginatedTool<GetProxyWebsocketHistory>("Displays items within the proxy WebSocket history") {
-        val allowed = runBlocking {
-            checkHistoryPermissionOrDeny(HistoryAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
-        }
-        if (!allowed) {
-            return@mcpPaginatedTool sequenceOf("WebSocket history access denied by Burp Suite")
-        }
+    mcpPaginatedTool<GetProxyWebsocketHistory, ProxyWebSocketMessage>(
+        "Displays items within the proxy WebSocket history",
+        mapper = { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+    ) {
+        requireHistoryAccess(HistoryAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
 
-        api.proxy().webSocketHistory().asSequence()
-            .map { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        api.proxy().webSocketHistory()
     }
 
-    mcpPaginatedTool<GetProxyWebsocketHistoryRegex>("Displays items matching a specified regex within the proxy WebSocket history") {
-        val allowed = runBlocking {
-            checkHistoryPermissionOrDeny(HistoryAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
-        }
-        if (!allowed) {
-            return@mcpPaginatedTool sequenceOf("WebSocket history access denied by Burp Suite")
-        }
+    mcpPaginatedTool<GetProxyWebsocketHistoryRegex, ProxyWebSocketMessage>(
+        "Displays items matching a specified regex within the proxy WebSocket history",
+        mapper = { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+    ) {
+        requireHistoryAccess(HistoryAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
 
         val compiledRegex = Pattern.compile(regex)
-        api.proxy().webSocketHistory { it.contains(compiledRegex) }.asSequence()
-            .map { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        api.proxy().webSocketHistory { it.contains(compiledRegex) }
     }
 
     mcpTool<SetTaskExecutionEngineState>("Sets the state of Burp's task execution engine (paused or unpaused)") {
