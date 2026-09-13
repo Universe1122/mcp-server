@@ -5,7 +5,99 @@ import burp.api.montoya.proxy.ProxyHttpRequestResponse
 import burp.api.montoya.proxy.ProxyWebSocketMessage
 import burp.api.montoya.scanner.audit.issues.AuditIssue
 import burp.api.montoya.websocket.Direction
+import burp.api.montoya.http.message.HttpHeader
+import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.http.message.responses.HttpResponse
 import kotlinx.serialization.Serializable
+
+internal const val MAX_HISTORY_REQUEST_BODY_BYTES = 1_048_576
+internal const val MAX_HISTORY_RESPONSE_BODY_BYTES = 4_194_304
+
+private val JAVASCRIPT_MEDIA_TYPES = setOf(
+    "application/ecmascript",
+    "application/javascript",
+    "text/ecmascript",
+    "text/javascript",
+)
+
+private val JAVASCRIPT_FILE_EXTENSIONS = setOf("js", "mjs", "cjs")
+
+private data class BoundedHttpMessage(
+    val raw: String,
+    val bodySize: Int,
+    val bodyTruncated: Boolean,
+)
+
+private fun boundedRawMessage(
+    startLine: String,
+    headers: List<HttpHeader>,
+    body: burp.api.montoya.core.ByteArray,
+    maxBodyBytes: Int,
+    bodyKind: String,
+): BoundedHttpMessage {
+    require(maxBodyBytes >= 0) { "maxBodyBytes must be non-negative" }
+
+    val bodySize = body.length()
+    val bodyTruncated = bodySize > maxBodyBytes
+    val storedBody = when {
+        bodySize == 0 || maxBodyBytes == 0 -> ""
+        bodyTruncated -> body.subArray(0, maxBodyBytes).toString()
+        else -> body.toString()
+    }
+
+    val raw = buildString {
+        append(startLine)
+        append("\r\n")
+        headers.forEach { header ->
+            append(header.name())
+            append(": ")
+            append(header.value())
+            append("\r\n")
+        }
+        append("\r\n")
+        append(storedBody)
+        if (bodyTruncated) {
+            append("[truncated $bodyKind body: stored $maxBodyBytes of $bodySize bytes]")
+        }
+    }
+
+    return BoundedHttpMessage(raw, bodySize, bodyTruncated)
+}
+
+private fun HttpRequest.toBoundedRaw(maxBodyBytes: Int): BoundedHttpMessage = boundedRawMessage(
+    startLine = "${method()} ${path()} ${httpVersion()}",
+    headers = headers(),
+    body = body(),
+    maxBodyBytes = maxBodyBytes,
+    bodyKind = "request",
+)
+
+private fun HttpResponse.toBoundedRaw(maxBodyBytes: Int): BoundedHttpMessage = boundedRawMessage(
+    startLine = "${httpVersion()} ${statusCode()} ${reasonPhrase()}",
+    headers = headers(),
+    body = body(),
+    maxBodyBytes = maxBodyBytes,
+    bodyKind = "response",
+)
+
+private fun ProxyHttpRequestResponse.isJavaScriptResponse(): Boolean {
+    val request = request()
+    val response = response() ?: return false
+
+    val extension = request?.fileExtension()?.trimStart('.')?.lowercase()
+    if (extension in JAVASCRIPT_FILE_EXTENSIONS) return true
+
+    val mediaType = response.headerValue("Content-Type")
+        ?.substringBefore(';')
+        ?.trim()
+        ?.lowercase()
+    if (mediaType in JAVASCRIPT_MEDIA_TYPES || mediaType?.endsWith("+javascript") == true) return true
+
+    val disposition = response.headerValue("Content-Disposition")?.lowercase().orEmpty()
+    if (JAVASCRIPT_FILE_EXTENSIONS.any { disposition.contains(".$it") }) return true
+
+    return response.statedMimeType().name == "SCRIPT" || response.inferredMimeType().name == "SCRIPT"
+}
 
 fun AuditIssue.toSerializableForm(): IssueDetails {
     return IssueDetails(
@@ -102,11 +194,25 @@ fun buildSiteMapTree(
     return byHost.mapValues { it.value.toImmutable() }
 }
 
-fun ProxyHttpRequestResponse.toSerializableForm(): HttpRequestResponse {
+fun ProxyHttpRequestResponse.toSerializableForm(
+    maxRequestBodyBytes: Int = MAX_HISTORY_REQUEST_BODY_BYTES,
+    maxResponseBodyBytes: Int = MAX_HISTORY_RESPONSE_BODY_BYTES,
+): HttpRequestResponse {
+    val isJavaScript = isJavaScriptResponse()
+    val request = request()?.toBoundedRaw(maxRequestBodyBytes)
+    // JavaScript is transferred through the bounded chunk tool and persisted by the collector.
+    // Keeping it out of this JSON page prevents the full bundle from being copied repeatedly.
+    val response = response()?.toBoundedRaw(if (isJavaScript) 0 else maxResponseBodyBytes)
+
     return HttpRequestResponse(
-        request = request()?.toString() ?: "<no request>",
-        response = response()?.toString() ?: "<no response>",
-        notes = annotations().notes()
+        request = request?.raw ?: "<no request>",
+        response = response?.raw ?: "<no response>",
+        notes = annotations().notes(),
+        requestBodySize = request?.bodySize,
+        responseBodySize = response?.bodySize,
+        requestBodyTruncated = request?.bodyTruncated ?: false,
+        responseBodyTruncated = response?.bodyTruncated ?: false,
+        responseIsJavaScript = isJavaScript,
     )
 }
 
@@ -163,7 +269,12 @@ enum class AuditIssueConfidence {
 data class HttpRequestResponse(
     val request: String?,
     val response: String?,
-    val notes: String?
+    val notes: String?,
+    val requestBodySize: Int? = null,
+    val responseBodySize: Int? = null,
+    val requestBodyTruncated: Boolean = false,
+    val responseBodyTruncated: Boolean = false,
+    val responseIsJavaScript: Boolean = false,
 )
 
 @Serializable

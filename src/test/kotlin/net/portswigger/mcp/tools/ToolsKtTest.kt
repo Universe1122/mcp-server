@@ -201,6 +201,36 @@ class ToolsKtTest {
         }
 
         @Test
+        fun `repeater line endings should be normalized to CRLF`() {
+            val repeater = mockk<burp.api.montoya.repeater.Repeater>(relaxed = true)
+            val contentSlot = slot<String>()
+            val request = mockk<HttpRequest>()
+
+            every { HttpRequest.httpRequest(any(), capture(contentSlot)) } returns request
+            every { api.repeater() } returns repeater
+
+            runBlocking {
+                client.callTool(
+                    "create_repeater_tab", mapOf(
+                        "tabName" to "normalized",
+                        "content" to "GET /foo HTTP/1.1\nHost: example.com\r\nX-Test: value\r\n\r\n",
+                        "targetHostname" to "example.com",
+                        "targetPort" to 80,
+                        "usesHttps" to false
+                    )
+                )
+
+                delay(100)
+            }
+
+            assertEquals(
+                "GET /foo HTTP/1.1\r\nHost: example.com\r\nX-Test: value\r\n\r\n",
+                contentSlot.captured,
+            )
+            verify(exactly = 1) { repeater.sendToRepeater(request, "normalized") }
+        }
+
+        @Test
         fun `http1 request should handle no response`() {
             val httpService = mockk<Http>()
             val contentSlot = slot<String>()
@@ -833,6 +863,42 @@ class ToolsKtTest {
                 delay(100)
                 assertEquals("Reached end of items", result3.expectTextContent())
             }
+        }
+
+        @Test
+        fun `get proxy response body chunk should only copy the requested range`() {
+            val proxy = mockk<Proxy>()
+            val historyItem = mockk<ProxyHttpRequestResponse>()
+            val response = mockk<HttpResponse>()
+            val body = mockk<ByteArray>()
+            val chunk = mockk<ByteArray>()
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(historyItem)
+            every { historyItem.response() } returns response
+            every { response.body() } returns body
+            every { body.length() } returns 10
+            every { body.subArray(2, 6) } returns chunk
+            every { chunk.getBytes() } returns byteArrayOf(2, 3, 4, 5)
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_response_body_chunk", mapOf(
+                        "index" to 0,
+                        "offset" to 2,
+                        "length" to 4,
+                    )
+                )
+
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"bodySize\":10"))
+                assertTrue(text.contains("\"dataBase64\":\"AgMEBQ==\""))
+                assertTrue(text.contains("\"eof\":false"))
+            }
+
+            verify(exactly = 1) { body.subArray(2, 6) }
+            verify(exactly = 0) { body.getBytes() }
+            verify(exactly = 0) { body.toString() }
         }
     }
     

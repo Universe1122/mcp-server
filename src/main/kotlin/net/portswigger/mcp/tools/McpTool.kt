@@ -11,6 +11,38 @@ import kotlinx.serialization.serializer
 import net.portswigger.mcp.schema.asInputSchema
 import kotlin.experimental.ExperimentalTypeInference
 
+@PublishedApi
+internal fun <J> buildPaginatedText(
+    items: List<J>,
+    offset: Int,
+    count: Int,
+    maxOutputChars: Int,
+    mapper: (J) -> CharSequence,
+): String {
+    require(maxOutputChars > 0) { "maxOutputChars must be positive" }
+
+    if (offset >= items.size) return "Reached end of items"
+
+    val upperLimit = (offset + count).coerceAtMost(items.size)
+    val output = StringBuilder()
+
+    for (item in items.subList(offset, upperLimit)) {
+        val serialized = mapper(item)
+        val separatorLength = if (output.isEmpty()) 0 else 2
+
+        // Always return at least one item so the caller can advance its offset. HTTP history
+        // items are bounded before they reach this function, so that first item is itself bounded.
+        if (output.isNotEmpty() && output.length + separatorLength + serialized.length > maxOutputChars) {
+            break
+        }
+
+        if (separatorLength > 0) output.append("\n\n")
+        output.append(serialized)
+    }
+
+    return output.toString()
+}
+
 @OptIn(InternalSerializationApi::class)
 inline fun <reified I : Any> Server.mcpTool(
     description: String,
@@ -70,6 +102,7 @@ inline fun <reified I : Any> Server.mcpTool(
 
 inline fun <reified I : Paginated, J : Any> Server.mcpPaginatedTool(
     description: String,
+    maxOutputChars: Int = Int.MAX_VALUE,
     noinline mapper: (J) -> CharSequence = { it.toString() },
     crossinline execute: I.() -> List<J>
 ) {
@@ -77,18 +110,7 @@ inline fun <reified I : Paginated, J : Any> Server.mcpPaginatedTool(
 
         val items = execute(this)
 
-        when {
-            offset >= items.size -> {
-                "Reached end of items"
-            }
-
-            else -> {
-                val upperLimit = (offset + count).coerceAtMost(items.size)
-
-                items.subList(offset, upperLimit)
-                    .joinToString(separator = "\n\n", transform = mapper)
-            }
-        }
+        buildPaginatedText(items, offset, count, maxOutputChars, mapper)
     })
 }
 
@@ -157,4 +179,3 @@ interface Paginated {
     val count: Int
     val offset: Int
 }
-

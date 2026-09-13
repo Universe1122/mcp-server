@@ -23,6 +23,7 @@ import net.portswigger.mcp.security.HistoryAccessSecurity
 import net.portswigger.mcp.security.HistoryAccessType
 import net.portswigger.mcp.security.HttpRequestSecurity
 import java.awt.KeyboardFocusManager
+import java.util.Base64
 import java.util.regex.Pattern
 import javax.swing.JTextArea
 
@@ -55,9 +56,13 @@ private fun requireHistoryAccess(
     if (!allowed) throw HistoryAccessDeniedException(logMessage)
 }
 
-private fun truncateIfNeeded(serialized: String): String {
-    return serialized
-}
+private const val MAX_HTTP_HISTORY_PAGE_CHARS = 16_777_216
+internal const val MAX_HTTP_HISTORY_BODY_CHUNK_BYTES = 262_144
+
+internal fun normalizeHttp1LineEndings(content: String): String = content
+    .replace("\r\n", "\n")
+    .replace('\r', '\n')
+    .replace("\n", "\r\n")
 
 fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
@@ -72,7 +77,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
         api.logging().logToOutput("MCP HTTP/1.1 request: $targetHostname:$targetPort")
 
-        val fixedContent = content.replace("\r", "").replace("\n", "\r\n")
+        val fixedContent = normalizeHttp1LineEndings(content)
 
         val request = HttpRequest.httpRequest(toMontoyaService(), fixedContent)
         val requestResponse = api.http().sendRequest(request)
@@ -131,8 +136,8 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         response?.toString() ?: "<no response>"
     }
 
-    mcpTool<CreateRepeaterTab>("Creates a new Repeater tab with the specified HTTP request and optional tab name. Make sure to use carriage returns appropriately.") {
-        val request = HttpRequest.httpRequest(toMontoyaService(), content)
+    mcpTool<CreateRepeaterTab>("Creates a new Repeater tab with the specified HTTP request and optional tab name. HTTP/1 line endings are normalized to CRLF.") {
+        val request = HttpRequest.httpRequest(toMontoyaService(), normalizeHttp1LineEndings(content))
         api.repeater().sendToRepeater(request, tabName)
     }
 
@@ -273,8 +278,15 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
     // 메시지까지 전부 문자열로 물린 다음 폐기했다. List 오버로드는 subList 로 먼저 자르고
     // transform 을 적용하므로, 실제로 반환되는 count 개만 직렬화된다.
     mcpPaginatedTool<GetProxyHttpHistory, ProxyHttpRequestResponse>(
-        "Displays items within the proxy HTTP history",
-        mapper = { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        "Displays items within the proxy HTTP history. To bound memory use, request bodies are " +
+                "limited to 1 MiB, non-JavaScript response bodies to 4 MiB, and each page to roughly " +
+                "16 MiB of characters. JavaScript bodies are omitted here and marked with " +
+                "responseIsJavaScript=true so they can be fetched through the bounded chunk tool. " +
+                "Each item reports the original body sizes and truncation flags. A " +
+                "byte-limited page can contain fewer items than count; advance offset by the number " +
+                "of items actually returned.",
+        maxOutputChars = MAX_HTTP_HISTORY_PAGE_CHARS,
+        mapper = { Json.encodeToString(it.toSerializableForm()) }
     ) {
         requireHistoryAccess(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history")
 
@@ -298,9 +310,50 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         }
     }
 
+    mcpTool<GetProxyHttpResponseBodyChunk>(
+        "Returns one bounded Base64 chunk of a proxy-history response body. Use this for JavaScript " +
+                "items whose get_proxy_http_history result has responseIsJavaScript=true. The body " +
+                "is never converted to a complete String or byte array; length is capped at 256 KiB."
+    ) {
+        requireHistoryAccess(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history response body")
+        require(index >= 0) { "index must be non-negative" }
+        require(offset >= 0) { "offset must be non-negative" }
+        require(length in 1..MAX_HTTP_HISTORY_BODY_CHUNK_BYTES) {
+            "length must be between 1 and $MAX_HTTP_HISTORY_BODY_CHUNK_BYTES"
+        }
+
+        val history = api.proxy().history()
+        val item = history.getOrNull(index) ?: error("No proxy HTTP history item at index $index")
+        val response = item.response() ?: error("Proxy HTTP history item $index has no response")
+        val body = response.body()
+        val bodySize = body.length()
+        require(offset <= bodySize) { "offset $offset exceeds response body size $bodySize" }
+
+        val endExclusive = minOf(offset.toLong() + length.toLong(), bodySize.toLong()).toInt()
+        val bytes = if (offset == endExclusive) {
+            byteArrayOf()
+        } else {
+            body.subArray(offset, endExclusive).getBytes()
+        }
+
+        Json.encodeToString(
+            ProxyHttpResponseBodyChunk(
+                index = index,
+                offset = offset,
+                bodySize = bodySize,
+                dataBase64 = Base64.getEncoder().encodeToString(bytes),
+                eof = endExclusive == bodySize,
+            )
+        )
+    }
+
     mcpPaginatedTool<GetProxyHttpHistoryRegex, ProxyHttpRequestResponse>(
-        "Displays items matching a specified regex within the proxy HTTP history",
-        mapper = { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        "Displays items matching a specified regex within the proxy HTTP history. Request bodies " +
+                "are limited to 1 MiB, non-JavaScript response bodies to 4 MiB, and each page to " +
+                "roughly 16 MiB of characters. JavaScript bodies are fetched separately through " +
+                "get_proxy_http_response_body_chunk. Advance offset by the number of items actually returned.",
+        maxOutputChars = MAX_HTTP_HISTORY_PAGE_CHARS,
+        mapper = { Json.encodeToString(it.toSerializableForm()) }
     ) {
         requireHistoryAccess(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history")
 
@@ -310,7 +363,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
     mcpPaginatedTool<GetProxyWebsocketHistory, ProxyWebSocketMessage>(
         "Displays items within the proxy WebSocket history",
-        mapper = { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        mapper = { Json.encodeToString(it.toSerializableForm()) }
     ) {
         requireHistoryAccess(HistoryAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
 
@@ -319,7 +372,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
     mcpPaginatedTool<GetProxyWebsocketHistoryRegex, ProxyWebSocketMessage>(
         "Displays items matching a specified regex within the proxy WebSocket history",
-        mapper = { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        mapper = { Json.encodeToString(it.toSerializableForm()) }
     ) {
         requireHistoryAccess(HistoryAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
 
@@ -481,6 +534,18 @@ data class GetProxyHttpHistory(override val count: Int, override val offset: Int
 
 @Serializable
 data class GetProxyHttpHistoryRegex(val regex: String, override val count: Int, override val offset: Int) : Paginated
+
+@Serializable
+data class GetProxyHttpResponseBodyChunk(val index: Int, val offset: Int, val length: Int)
+
+@Serializable
+data class ProxyHttpResponseBodyChunk(
+    val index: Int,
+    val offset: Int,
+    val bodySize: Int,
+    val dataBase64: String,
+    val eof: Boolean,
+)
 
 @Serializable
 data class GetProxyWebsocketHistory(override val count: Int, override val offset: Int) : Paginated
