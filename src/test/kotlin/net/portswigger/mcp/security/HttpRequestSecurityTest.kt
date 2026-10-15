@@ -165,7 +165,7 @@ class HttpRequestSecurityTest {
             "configEditingTooling" to false,
             "requireHttpRequestApproval" to true,
             "host" to "127.0.0.1",
-            "_autoApproveTargets" to "example.com,,  ,test.org",
+            "_autoApproveTargets" to "example.com\ninvalid,entry\n  \ntest.org",
             "port" to 9876
         )
 

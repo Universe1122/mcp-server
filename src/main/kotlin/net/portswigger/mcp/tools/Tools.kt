@@ -17,6 +17,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import net.portswigger.mcp.config.McpConfig
+import net.portswigger.mcp.packet.PacketRepository
 import net.portswigger.mcp.schema.buildSiteMapTree
 import net.portswigger.mcp.schema.toSerializableForm
 import net.portswigger.mcp.security.HistoryAccessSecurity
@@ -59,12 +60,41 @@ private fun requireHistoryAccess(
 private const val MAX_HTTP_HISTORY_PAGE_CHARS = 16_777_216
 internal const val MAX_HTTP_HISTORY_BODY_CHUNK_BYTES = 262_144
 
-internal fun normalizeHttp1LineEndings(content: String): String = content
-    .replace("\r\n", "\n")
-    .replace('\r', '\n')
+private fun buildHttp2HeaderList(
+    pseudoHeaders: Map<String, String>, headers: Map<String, String>
+): List<HttpHeader> {
+    val orderedNames = listOf(":scheme", ":method", ":path", ":authority")
+    val fixed = LinkedHashMap<String, String>().apply {
+        orderedNames.forEach { name ->
+            val value = pseudoHeaders[name.removePrefix(":")] ?: pseudoHeaders[name]
+            if (value != null) put(name, value)
+        }
+        pseudoHeaders.forEach { (key, value) ->
+            val name = if (key.startsWith(":")) key else ":$key"
+            if (!containsKey(name)) put(name, value)
+        }
+    }
+    return (fixed + headers).map { HttpHeader.httpHeader(it.key.lowercase(), it.value) }
+}
+
+/** Normalize the request line and headers while preserving the body verbatim. */
+internal fun normalizeHttpContent(content: String): String {
+    val markers = listOf("\r\n\r\n", "\n\n", "\\r\\n\\r\\n", "\\n\\n")
+    val end = markers.mapNotNull { marker ->
+        content.indexOf(marker).takeIf { it >= 0 }?.let { it to marker.length }
+    }.minByOrNull { it.first }?.let { it.first + it.second }
+    return if (end == null) normalizePrelude(content)
+    else normalizePrelude(content.substring(0, end)) + content.substring(end)
+}
+
+private fun normalizePrelude(prelude: String): String = prelude
+    .replace("\\r\\n", "\n")
+    .replace("\\n", "\n")
+    .replace("\\r", "")
+    .replace("\r", "")
     .replace("\n", "\r\n")
 
-fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
+fun Server.registerTools(api: MontoyaApi, config: McpConfig, packets: PacketRepository) {
 
     mcpTool<SendHttp1Request>("Issues an HTTP/1.1 request and returns the response.") {
         val allowed = runBlocking {
@@ -77,10 +107,12 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
         api.logging().logToOutput("MCP HTTP/1.1 request: $targetHostname:$targetPort")
 
-        val fixedContent = normalizeHttp1LineEndings(content)
+        val fixedContent = normalizeHttpContent(content)
 
         val request = HttpRequest.httpRequest(toMontoyaService(), fixedContent)
         val requestResponse = api.http().sendRequest(request)
+        runCatching { packets.saveSent(request, requestResponse?.response()) }
+            .onFailure { api.logging().logToError("Failed to store MCP HTTP request: ${it.message}") }
 
         requestResponse?.response()?.toString() ?: "<no response>"
     }
@@ -110,39 +142,28 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
         api.logging().logToOutput("MCP HTTP/2 request: $targetHostname:$targetPort")
 
-        val orderedPseudoHeaderNames = listOf(":scheme", ":method", ":path", ":authority")
-
-        val fixedPseudoHeaders = LinkedHashMap<String, String>().apply {
-            orderedPseudoHeaderNames.forEach { name ->
-                val value = pseudoHeaders[name.removePrefix(":")] ?: pseudoHeaders[name]
-                if (value != null) {
-                    put(name, value)
-                }
-            }
-
-            pseudoHeaders.forEach { (key, value) ->
-                val properKey = if (key.startsWith(":")) key else ":$key"
-                if (!containsKey(properKey)) {
-                    put(properKey, value)
-                }
-            }
-        }
-
-        val headerList = (fixedPseudoHeaders + headers).map { HttpHeader.httpHeader(it.key.lowercase(), it.value) }
+        val headerList = buildHttp2HeaderList(pseudoHeaders, headers)
 
         val request = HttpRequest.http2Request(toMontoyaService(), headerList, requestBody)
         val response = api.http().sendRequest(request, HttpMode.HTTP_2)
+        runCatching { packets.saveSent(request, response?.response()) }
+            .onFailure { api.logging().logToError("Failed to store MCP HTTP/2 request: ${it.message}") }
 
         response?.toString() ?: "<no response>"
     }
 
-    mcpTool<CreateRepeaterTab>("Creates a new Repeater tab with the specified HTTP request and optional tab name. HTTP/1 line endings are normalized to CRLF.") {
-        val request = HttpRequest.httpRequest(toMontoyaService(), normalizeHttp1LineEndings(content))
+    mcpUnitTool<CreateRepeaterTab>("Creates an HTTP/1.1 Repeater tab with the specified raw HTTP request and optional tab name. Prefer create_repeater_tab_http2 for HTTP/2 targets.") {
+        val request = HttpRequest.httpRequest(toMontoyaService(), normalizeHttpContent(content))
         api.repeater().sendToRepeater(request, tabName)
     }
 
-    mcpTool<SendToIntruder>("Sends an HTTP request to Intruder with the specified HTTP request and optional tab name. Make sure to use carriage returns appropriately.") {
-        val request = HttpRequest.httpRequest(toMontoyaService(), content)
+    mcpUnitTool<CreateRepeaterTabHttp2>("Creates an HTTP/2 Repeater tab with the specified HTTP/2 request and optional tab name. Do NOT pass headers to the body parameter.") {
+        val request = HttpRequest.http2Request(toMontoyaService(), buildHttp2HeaderList(pseudoHeaders, headers), requestBody)
+        api.repeater().sendToRepeater(request, tabName)
+    }
+
+    mcpUnitTool<SendToIntruder>("Sends an HTTP request to Intruder with the specified HTTP request and optional tab name. HTTP/1 line endings are normalized to CRLF.") {
+        val request = HttpRequest.httpRequest(toMontoyaService(), normalizeHttpContent(content))
         api.intruder().sendToIntruder(request, tabName)
     }
 
@@ -474,6 +495,17 @@ data class SendHttp2Request(
 data class CreateRepeaterTab(
     val tabName: String?,
     val content: String,
+    override val targetHostname: String,
+    override val targetPort: Int,
+    override val usesHttps: Boolean
+) : HttpServiceParams
+
+@Serializable
+data class CreateRepeaterTabHttp2(
+    val tabName: String?,
+    val pseudoHeaders: Map<String, String>,
+    val headers: Map<String, String>,
+    val requestBody: String,
     override val targetHostname: String,
     override val targetPort: Int,
     override val usesHttps: Boolean

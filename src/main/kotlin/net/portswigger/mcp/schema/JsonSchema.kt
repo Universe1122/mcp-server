@@ -1,6 +1,7 @@
 package net.portswigger.mcp.schema
 
-import io.modelcontextprotocol.kotlin.sdk.Tool
+import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -44,19 +45,20 @@ fun getJsonSchemaForProperty(kType: kotlin.reflect.KType): JsonElement {
     }
 }
 
-fun KClass<*>.asInputSchema(): Tool.Input {
+fun KClass<*>.asInputSchema(serializer: KSerializer<*>): ToolSchema {
     val properties = mutableMapOf<String, JsonElement>()
     val required = mutableListOf<String>()
+    val descriptor = serializer.descriptor
+    val membersByName = memberProperties.associateBy { it.name }
 
-    for (prop in memberProperties) {
-        properties[prop.name] = getJsonSchemaForProperty(prop.returnType)
-
-        if (!prop.returnType.isMarkedNullable) {
-            required.add(prop.name)
-        }
+    for (index in 0 until descriptor.elementsCount) {
+        val name = descriptor.getElementName(index)
+        val property = membersByName[name] ?: continue
+        properties[name] = getJsonSchemaForProperty(property.returnType)
+        if (!descriptor.isElementOptional(index)) required.add(name)
     }
 
-    return Tool.Input(
+    return ToolSchema(
         properties = JsonObject(properties),
         required = required
     )

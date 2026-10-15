@@ -6,14 +6,34 @@ import burp.api.montoya.http.message.MimeType
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.proxy.ProxyHttpRequestResponse
+import net.portswigger.mcp.packet.SearchPacket
+import net.portswigger.mcp.packet.StartPacketCapture
+import net.portswigger.mcp.packet.StopPacketCapture
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class SerializationTest {
+    @Test
+    fun `tool schema requires only fields without defaults`() {
+        val start = StartPacketCapture::class.asInputSchema(StartPacketCapture.serializer())
+        val stop = StopPacketCapture::class.asInputSchema(StopPacketCapture.serializer())
+        val search = SearchPacket::class.asInputSchema(SearchPacket.serializer())
+
+        assertEquals(listOf("projectPath"), start.required)
+        assertTrue(stop.required.orEmpty().isEmpty())
+        assertEquals(setOf("targets", "ftsSearchQuery"), search.required.orEmpty().toSet())
+        assertFalse("limit" in search.required.orEmpty())
+        assertFalse("groupSimilar" in search.required.orEmpty())
+    }
+
     @Test
     fun `proxy history truncates bodies before converting complete messages to strings`() {
         val requestBody = mockk<ByteArray>()
@@ -68,6 +88,10 @@ class SerializationTest {
         assertEquals(20, result.responseBodySize)
         assertTrue(result.requestBodyTruncated)
         assertTrue(result.responseBodyTruncated)
+        val serialized = Json.encodeToString(result)
+        val parsed = Json.parseToJsonElement(serialized).jsonObject
+        assertEquals(result.request, parsed.getValue("request").jsonPrimitive.content)
+        assertEquals(result.response, parsed.getValue("response").jsonPrimitive.content)
         verify(exactly = 0) { request.toString() }
         verify(exactly = 0) { response.toString() }
     }

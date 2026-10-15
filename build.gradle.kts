@@ -4,8 +4,8 @@ abstract class EmbedProxyJarTask : DefaultTask() {
     @get:InputFile
     abstract val shadowJarFile: RegularFileProperty
 
-    @get:InputDirectory
-    abstract val projectDir: DirectoryProperty
+    @get:InputFile
+    abstract val proxyJarFile: RegularFileProperty
 
     @get:Inject
     abstract val execOperations: ExecOperations
@@ -13,15 +13,15 @@ abstract class EmbedProxyJarTask : DefaultTask() {
     @TaskAction
     fun embedJar() {
         val shadowJar = shadowJarFile.get().asFile
-        val libsDir = projectDir.dir("libs").get().asFile
-        val proxyJarFile = File(libsDir, "mcp-proxy-all.jar")
+        val proxyJarFile = proxyJarFile.get().asFile
+        val libsDir = proxyJarFile.parentFile
 
         if (!proxyJarFile.exists()) {
             throw GradleException("Proxy JAR not found at: ${proxyJarFile.absolutePath}")
         }
 
         execOperations.exec {
-            workingDir(projectDir.get().asFile)
+            workingDir(libsDir)
             commandLine("jar", "uf", shadowJar.absolutePath, "-C", libsDir.absolutePath, proxyJarFile.name)
         }
 
@@ -47,6 +47,7 @@ dependencies {
     implementation(libs.kotlin.stdlib)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.mcp.kotlin.sdk)
+    implementation(libs.sqlite.jdbc)
 
     testImplementation(libs.bundles.test.framework)
     testImplementation(libs.bundles.ktor.test)
@@ -65,8 +66,8 @@ kotlin {
     }
 
     compilerOptions {
-        apiVersion.set(org.jetbrains.kotlin.gradle.dsl.KotlinVersion.KOTLIN_2_2)
-        languageVersion.set(org.jetbrains.kotlin.gradle.dsl.KotlinVersion.KOTLIN_2_2)
+        apiVersion.set(org.jetbrains.kotlin.gradle.dsl.KotlinVersion.KOTLIN_2_4)
+        languageVersion.set(org.jetbrains.kotlin.gradle.dsl.KotlinVersion.KOTLIN_2_4)
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
         freeCompilerArgs.addAll(
             "-Xjsr305=strict"
@@ -133,7 +134,7 @@ tasks {
         description = "Embeds the MCP proxy JAR into the shadow JAR"
         dependsOn(shadowJar)
         shadowJarFile.set(shadowJar.flatMap { it.archiveFile })
-        projectDir.set(layout.projectDirectory)
+        proxyJarFile.set(layout.projectDirectory.file("libs/mcp-proxy-all.jar"))
     }
 
     build {

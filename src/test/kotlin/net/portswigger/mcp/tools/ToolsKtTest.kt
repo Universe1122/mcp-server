@@ -23,8 +23,8 @@ import io.mockk.*
 import java.net.InetAddress
 import java.time.ZonedDateTime
 import java.util.Optional
-import io.modelcontextprotocol.kotlin.sdk.CallToolResultBase
-import io.modelcontextprotocol.kotlin.sdk.TextContent
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -63,7 +63,7 @@ class ToolsKtTest {
             every { getBoolean("_alwaysAllowHttpHistory") } returns false
             every { getBoolean("_alwaysAllowWebSocketHistory") } returns false
             every { getString("host") } returns "127.0.0.1"
-            every { getString("autoApproveTargets") } returns ""
+            every { getString("_autoApproveTargets") } returns ""
             every { getInteger("port") } returns testPort
             every { setBoolean(any(), any()) } returns Unit
             every { setString(any(), any()) } returns Unit
@@ -81,7 +81,7 @@ class ToolsKtTest {
         mockkStatic(HttpRequest::class)
     }
 
-    private fun CallToolResultBase?.expectTextContent(
+    private fun CallToolResult?.expectTextContent(
         expected: String? = null,
     ): String {
         assertNotNull(this, "Tool result cannot be null")
@@ -391,6 +391,35 @@ class ToolsKtTest {
         }
     }
     
+    @Test
+    fun `create repeater tab http2 builds ordered headers and preserves body`() {
+        val repeater = mockk<burp.api.montoya.repeater.Repeater>(relaxed = true)
+        val request = mockk<HttpRequest>()
+        val headersSlot = slot<List<HttpHeader>>()
+        val bodySlot = slot<String>()
+        every { HttpRequest.http2Request(any(), capture(headersSlot), capture(bodySlot)) } returns request
+        every { api.repeater() } returns repeater
+
+        runBlocking {
+            val result = client.callTool("create_repeater_tab_http2", mapOf(
+                "tabName" to "h2-tab",
+                "pseudoHeaders" to Json.encodeToJsonElement(mapOf("method" to "POST", "path" to "/api/x", "authority" to "example.com", "scheme" to "https")),
+                "headers" to Json.encodeToJsonElement(mapOf("Content-Type" to "application/json")),
+                "requestBody" to "{\"k\":\"v\"}",
+                "targetHostname" to "example.com",
+                "targetPort" to 443,
+                "usesHttps" to true
+            ))
+            assertNotNull(result)
+            assertFalse(result!!.isError ?: false)
+        }
+
+        verify(exactly = 1) { repeater.sendToRepeater(request, "h2-tab") }
+        assertEquals("{\"k\":\"v\"}", bodySlot.captured)
+        assertEquals(listOf(":scheme", ":method", ":path", ":authority"), headersSlot.captured.filter { it.name().startsWith(":") }.map { it.name() })
+        assertTrue(headersSlot.captured.any { it.name() == "content-type" && it.value() == "application/json" })
+    }
+
     @Nested
     inner class UtilityToolsTests {
         @Test

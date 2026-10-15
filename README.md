@@ -105,19 +105,38 @@ The extension has an installer which will automatically configure the client set
 
 3. **Restart Claude Desktop** - assuming Burp is running with the extension loaded.
 
+## Persistent packet database
+
+Call `start_packet_capture` with an existing project directory. The extension opens or creates
+`packets.sqlite3` there, scans the current Burp Proxy HTTP history from the beginning, and then
+collects new completed exchanges every five seconds. Reconnecting to the same directory rescans
+history but does not insert exact duplicate exchanges. Switching directories creates a separate
+database and imports the current history into it. `stop_packet_capture` stops collection; by default
+the database remains available for queries. The extension must be running for its MCP tools to work.
+
+Packet request and response bodies are deduplicated by their raw SHA-256 hash for every MIME type.
+Bodies over 16 MiB are kept in `raw/resources/mcp-server/blobs/` under the project directory and
+referenced by the database; the resource manifest marks these files as non-regenerable. FTS5 indexes
+UTF-8 text bodies, using the first 4 MiB of a larger body. Export complete messages with
+`save_packets` when searching beyond that indexed prefix. `search_packet` groups similar results by
+default; set `groupSimilar=false` to see every distinct exchange. Packet IDs remain stable within a
+database. The database schema differs from the former Python wrapper's schema, and existing wrapper
+databases are not automatically migrated.
+
+Use `get_db_info`, `get_packet_count`, `get_all_hosts_by_db`, `search_packet`, `get_packet`,
+`get_referer_of`, `find_packets_by_referer`, `query_burp_database`, and `save_packets` to inspect the
+stored data. `query_burp_database` accepts a single read-only `SELECT` and limits rows and field
+lengths. Requests sent through this MCP server's HTTP tools are also stored when a database is
+connected; search can exclude them with `excludeMcpSent=true`.
+
 ## Manual installations
 If you want to install the MCP server manually you can either use the extension's SSE server directly or the packaged
 Stdio proxy server.
 
 ### SSE MCP Server
-In order to use the SSE server directly you can just provide the url for the server in your client's configuration. Depending
-on your client and your configuration in the extension this may be with or without the `/sse` path.
+To use the SSE server directly, provide the configured server URL to your MCP client:
 ```
 http://127.0.0.1:9876
-```
-or
-```
-http://127.0.0.1:9876/sse
 ```
 
 ### Stdio MCP Proxy Server
@@ -132,12 +151,22 @@ Once you have the jar you can add the following command and args to your client 
 /path/to/packaged/burp/java -jar /path/to/proxy/jar/mcp-proxy-all.jar --sse-url http://127.0.0.1:9876
 ```
 
+If you modify the proxy source, rebuild and copy it into this project before packaging the extension:
+```bash
+# From mcp-proxy
+./gradlew shadowJar
+cp build/libs/mcp-proxy-all.jar /path/to/mcp-server/libs/mcp-proxy-all.jar
+
+# From mcp-server
+./gradlew embedProxyJar
+```
+
 ### Creating / modifying tools
 
 Tools are defined in `src/main/kotlin/net/portswigger/mcp/tools/Tools.kt`. To define new tools, create a new serializable
 data class with the required parameters which will come from the LLM.
 
 The tool name is auto-derived from its parameters data class. A description is also needed for the LLM. You can return
-a string (or richer PromptMessageContents) to provide data back to the LLM.
+a string or a `List<ContentBlock>` to provide data back to the LLM.
 
 Extend the Paginated interface to add auto-pagination support.

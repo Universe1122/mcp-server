@@ -1,12 +1,13 @@
 [versions]
 # Build System
-kotlin = "2.2.21"
+kotlin = "2.4.0"
 ktor = "3.3.1"
 
 # Runtime Dependencies
 kotlinx-serialization = "1.9.0"
-mcp-sdk = "0.7.4"
+mcp-sdk = "0.15.0"
 burp-montoya = "2025.10"
+sqlite-jdbc = "3.53.4.0"
 
 # Test Dependencies
 mockk = "1.14.6"
@@ -29,6 +30,7 @@ mcp-kotlin-sdk = { module = "io.modelcontextprotocol:kotlin-sdk", version.ref = 
 
 # Montoya
 burp-montoya-api = { module = "net.portswigger.burp.extensions:montoya-api", version.ref = "burp-montoya" }
+sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqlite-jdbc" }
 
 # Test Dependencies
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }

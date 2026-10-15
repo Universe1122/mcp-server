@@ -8,12 +8,14 @@ import io.ktor.server.netty.*
 import io.ktor.server.plugins.cors.routing.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
-import io.modelcontextprotocol.kotlin.sdk.Implementation
-import io.modelcontextprotocol.kotlin.sdk.ServerCapabilities
 import io.modelcontextprotocol.kotlin.sdk.server.Server
+import io.modelcontextprotocol.kotlin.sdk.types.Implementation
+import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.server.mcp
 import net.portswigger.mcp.config.McpConfig
+import net.portswigger.mcp.packet.PacketRepository
+import net.portswigger.mcp.packet.registerPacketTools
 import net.portswigger.mcp.tools.registerTools
 import java.net.URI
 import java.util.concurrent.ExecutorService
@@ -23,6 +25,7 @@ import java.util.concurrent.TimeUnit
 class KtorServerManager(private val api: MontoyaApi) : ServerManager {
 
     private var server: EmbeddedServer<*, *>? = null
+    private val packets = PacketRepository(api)
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
 
     override fun start(config: McpConfig, callback: (ServerState) -> Unit) {
@@ -96,7 +99,8 @@ class KtorServerManager(private val api: MontoyaApi) : ServerManager {
                         mcpServer
                     }
 
-                    mcpServer.registerTools(api, config)
+                    mcpServer.registerTools(api, config, packets)
+                    mcpServer.registerPacketTools(packets)
                 }.apply {
                     start(wait = false)
                 }
@@ -118,6 +122,7 @@ class KtorServerManager(private val api: MontoyaApi) : ServerManager {
             try {
                 server?.stop(1000, 5000)
                 server = null
+                packets.stop()
                 api.logging().logToOutput("Stopped MCP server")
                 callback(ServerState.Stopped)
             } catch (e: Exception) {
@@ -130,6 +135,7 @@ class KtorServerManager(private val api: MontoyaApi) : ServerManager {
     override fun shutdown() {
         server?.stop(1000, 5000)
         server = null
+        packets.close()
 
         executor.shutdown()
         executor.awaitTermination(10, TimeUnit.SECONDS)
