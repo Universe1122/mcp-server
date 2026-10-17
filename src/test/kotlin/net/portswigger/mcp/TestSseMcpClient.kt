@@ -9,6 +9,8 @@ import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.EmptyResult
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
+import io.modelcontextprotocol.kotlin.sdk.types.ReadResourceRequest
+import io.modelcontextprotocol.kotlin.sdk.types.ReadResourceRequestParams
 import org.slf4j.LoggerFactory
 
 class TestSseMcpClient {
@@ -66,6 +68,13 @@ class TestSseMcpClient {
             throw e
         }
     }
+
+    suspend fun listResourceUris(): List<String> = mcp.listResources().resources.map { it.uri }
+
+    suspend fun readResource(uri: String): String = mcp.readResource(ReadResourceRequest(ReadResourceRequestParams(uri)))
+        .contents.filterIsInstance<io.modelcontextprotocol.kotlin.sdk.types.TextResourceContents>().single().text
+
+    suspend fun listPromptNames(): List<String> = mcp.listPrompts().prompts.map { it.name }
 
     suspend fun callTool(toolName: String, arguments: Map<String, Any>): CallToolResult? {
         try {

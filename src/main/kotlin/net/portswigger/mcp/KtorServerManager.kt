@@ -14,8 +14,11 @@ import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.server.mcp
 import net.portswigger.mcp.config.McpConfig
+import net.portswigger.mcp.config.ProjectStorageConfig
 import net.portswigger.mcp.packet.PacketRepository
 import net.portswigger.mcp.packet.registerPacketTools
+import net.portswigger.mcp.openapi.OpenApiStore
+import net.portswigger.mcp.openapi.registerOpenApiTools
 import net.portswigger.mcp.tools.registerTools
 import java.net.URI
 import java.util.concurrent.ExecutorService
@@ -26,6 +29,11 @@ class KtorServerManager(private val api: MontoyaApi) : ServerManager {
 
     private var server: EmbeddedServer<*, *>? = null
     private val packets = PacketRepository(api)
+    private val storage = ProjectStorageConfig()
+    val openApiStore = OpenApiStore(
+        { packets.projectDirectory() ?: storage.current()?.databaseDirectory },
+        { storage.current()?.openApiDirectory },
+    )
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
 
     override fun start(config: McpConfig, callback: (ServerState) -> Unit) {
@@ -33,13 +41,19 @@ class KtorServerManager(private val api: MontoyaApi) : ServerManager {
 
         executor.submit {
             try {
+                if (config.projectConfigPath.isNotBlank()) {
+                    runCatching { storage.load(config.projectConfigPath) }
+                        .onFailure { api.logging().logToError("Could not load project config: ${it.message}") }
+                }
                 server?.stop(1000, 5000)
                 server = null
 
                 val mcpServer = Server(
                     serverInfo = Implementation("burp-suite", "1.1.2"), options = ServerOptions(
                         capabilities = ServerCapabilities(
-                            tools = ServerCapabilities.Tools(listChanged = false)
+                            tools = ServerCapabilities.Tools(listChanged = false),
+                            resources = ServerCapabilities.Resources(listChanged = false),
+                            prompts = ServerCapabilities.Prompts(listChanged = false),
                         )
                     )
                 )
@@ -100,7 +114,8 @@ class KtorServerManager(private val api: MontoyaApi) : ServerManager {
                     }
 
                     mcpServer.registerTools(api, config, packets)
-                    mcpServer.registerPacketTools(packets)
+                    mcpServer.registerPacketTools(packets, storage, config, openApiStore)
+                    mcpServer.registerOpenApiTools(openApiStore)
                 }.apply {
                     start(wait = false)
                 }

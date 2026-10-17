@@ -48,6 +48,7 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.mcp.kotlin.sdk)
     implementation(libs.sqlite.jdbc)
+    implementation(libs.snakeyaml.engine)
 
     testImplementation(libs.bundles.test.framework)
     testImplementation(libs.bundles.ktor.test)

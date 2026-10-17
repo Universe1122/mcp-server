@@ -8,6 +8,10 @@ import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.proxy.ProxyHttpRequestResponse
 import io.mockk.every
 import io.mockk.mockk
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -15,6 +19,38 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 class PacketRepositoryTest {
+    @Test
+    fun `schema and paged HAR export expose stored packets`(@TempDir project: Path) {
+        val api = mockk<MontoyaApi>(relaxed = true)
+        every { api.proxy().history() } returns listOf(item(10, ""), item(11, "X-Variant: second\r\n"))
+
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            val schema = packets.schema()
+            assertTrue(schema.createStatements.getValue("burp_packets").contains("request_body_hash"))
+            assertTrue(schema.createStatements.getValue("packet_blobs").contains("file_path"))
+
+            val firstPath = project.resolve("first.har")
+            val first = packets.exportHar(firstPath.toString(), "example.com", 0, 1, 1024, false)
+            assertEquals(1, first.exported)
+            assertEquals(1L, first.lastId)
+            assertTrue(first.hasMore)
+            val entry = Json.parseToJsonElement(Files.readString(firstPath)).jsonObject
+                .getValue("log").jsonObject.getValue("entries").jsonArray.single().jsonObject
+            assertEquals("GET", entry.getValue("request").jsonObject.getValue("method").jsonPrimitive.content)
+            assertEquals("{\"token\":\"alpha\"}", entry.getValue("response").jsonObject
+                .getValue("content").jsonObject.getValue("text").jsonPrimitive.content)
+
+            val second = packets.exportHar(project.resolve("second.har").toString(), null, first.lastId!!, 1, 0, false)
+            assertEquals(1, second.exported)
+            assertFalse(second.hasMore)
+            assertEquals(1, second.skippedResponseBodies)
+            assertThrows(IllegalArgumentException::class.java) {
+                packets.exportHar(firstPath.toString(), null, 0, 1, 1024, false)
+            }
+        }
+    }
+
     @Test
     fun `rescan skips exact packets and stores identical bodies once`(@TempDir project: Path) {
         val first = item(10, "")
@@ -27,7 +63,21 @@ class PacketRepositoryTest {
             assertEquals(2, firstStart.scanned)
             assertEquals(2, firstStart.inserted)
             assertEquals(2, packets.count())
-            assertEquals(2, packets.querySelect("SELECT count(*) AS n FROM packet_blobs", 10).single().getValue("n")?.toInt())
+            assertEquals(2, packets.querySelect("SELECT count(*) AS n FROM packet_blobs", 10).rows.single().getValue("n")?.toInt())
+
+            val firstPage = packets.querySelect("SELECT id, method FROM burp_packets ORDER BY id", 1)
+            assertEquals(listOf("1"), firstPage.rows.map { it.getValue("id") })
+            assertTrue(firstPage.hasMore)
+            assertEquals(1, firstPage.nextOffset)
+
+            val secondPage = packets.querySelect("SELECT id, method FROM burp_packets ORDER BY id", 1, firstPage.nextOffset!!)
+            assertEquals(listOf("2"), secondPage.rows.map { it.getValue("id") })
+            assertFalse(secondPage.hasMore)
+            assertNull(secondPage.nextOffset)
+            assertTrue(packets.querySelect("SELECT id FROM burp_packets ORDER BY id", 1, 2).rows.isEmpty())
+            assertThrows(IllegalArgumentException::class.java) {
+                packets.querySelect("SELECT id FROM burp_packets", 1, -1)
+            }
 
             val matches = packets.search("alpha", listOf("response_body"), emptyList(), null, null, null, false, true, 30, 0)
             assertEquals(1, matches.size)

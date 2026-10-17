@@ -123,11 +123,86 @@ default; set `groupSimilar=false` to see every distinct exchange. Packet IDs rem
 database. The database schema differs from the former Python wrapper's schema, and existing wrapper
 databases are not automatically migrated.
 
-Use `get_db_info`, `get_packet_count`, `get_all_hosts_by_db`, `search_packet`, `get_packet`,
+Use `get_db_info`, `get_db_schema`, `get_packet_count`, `get_all_hosts_by_db`, `search_packet`, `get_packet`,
 `get_referer_of`, `find_packets_by_referer`, `query_burp_database`, and `save_packets` to inspect the
-stored data. `query_burp_database` accepts a single read-only `SELECT` and limits rows and field
-lengths. Requests sent through this MCP server's HTTP tools are also stored when a database is
+stored data. `query_burp_database` accepts a single read-only `SELECT` and returns a page with
+`rows`, `hasMore`, and `nextOffset`. Set `maxRows` (1–500) and pass `nextOffset` as the next call's
+`offset` until `hasMore` is false. Use a stable `ORDER BY`, such as `ORDER BY id`, when paging
+through packets. Field lengths and query execution time remain bounded. Requests sent through this
+MCP server's HTTP tools are also stored when a database is
 connected; search can exclude them with `excludeMcpSent=true`.
+
+`get_db_schema` returns the actual SQLite `CREATE TABLE` statements for `burp_packets`,
+`packet_blobs`, and `packet_body_fts`. Packet heads are stored in `burp_packets`; body hashes join
+to `packet_blobs`. When `packet_blobs.file_path` is set, resolve it relative to the directory
+containing `packets.sqlite3`.
+
+Use `export_packets_har` to write a local HAR file for tools such as
+[mitmproxy2swagger](https://github.com/alufers/mitmproxy2swagger). Set `host` to an exact hostname,
+`outputPath` to a new file, and optionally `afterId`, `limit`, and `maxBodyBytes`. The result returns
+`lastId` and `hasMore`; use `lastId` as the next call's `afterId` and a different output file until
+`hasMore` is false. Only packets with responses are exported. Bodies exceeding `maxBodyBytes`
+(default 1 MiB) or lacking valid UTF-8 are omitted, with counts in the result. The HAR contains
+captured headers and any included bodies, so it may contain credentials or personal data. Keep it
+local and review it before sharing. The extension exports traffic; an agent or external tool can
+build or update the OpenAPI spec from the HAR and an existing spec.
+For mitmproxy2swagger, run:
+
+```sh
+mitmproxy2swagger -i export.har -o openapi.yaml -p https://api.example.com -f har
+```
+
+Review the generated `x-path-templates`, remove `ignore:` from accepted paths, then run the
+same command again. Reuse the existing `openapi.yaml` for
+subsequent exports; review changes because the tool preserves existing endpoint descriptions.
+
+## Agent-authored OpenAPI and Swagger tab
+
+The extension does not infer OpenAPI from traffic. The agent reads saved packets and any existing
+spec, writes OpenAPI 3.x YAML, and saves `<host>.yaml` directly in the folder selected by
+`storage.openapi_dir` in the project's `config.yaml`. The Burp **MCP → Swagger** tab lists those files by
+host, shows a read-only Swagger-style API explorer, and reloads changed files. Click anywhere on an
+operation row to expand its description, source packet IDs, parameters, request body, response
+examples, and schemas. The viewer has White and Dark themes, and the expanded detail scrolls with
+the main page even when the pointer is over a parameter or response example. Search filters paths,
+methods, summaries, tags, and operation IDs. Schema
+trees resolve local `#/components/schemas/` references with a recursion limit. **Try it out →
+Repeater** creates an editable request tab from the documented server, path, required parameters,
+and request body. Editable example values in the Parameters section populate the Repeater draft;
+the agent can supply observed values with OpenAPI `example`, and the viewer uses temporary sample
+values where the spec has none. Review these values before sending. Creating the tab does not
+transmit the request. The Swing viewer works without a browser engine.
+
+For example, the project can contain:
+
+```yaml
+storage:
+  db_dir: .
+  openapi_dir: raw/resources/mcp-server/openapi
+```
+
+Paths may also be absolute; relative paths are resolved from `config.yaml`. After the user provides
+that file and authorizes `cafe.naver.com` as the host to document, the agent calls
+`load_project_config` with its path and then `start_packet_capture`. The extension remembers the
+config path for Swagger after a Burp restart. The agent then pages
+through a metadata query such as:
+
+```sql
+SELECT id, method, url, path, status_code, request_body_hash, response_body_hash
+FROM burp_packets WHERE host = 'cafe.naver.com' ORDER BY id
+```
+
+Use `get_packet` for representative request and response bodies, and
+`list_openapi_specs` / `get_openapi_spec` to read an existing spec. Save the finished document as
+`<storage.openapi_dir>/cafe.naver.com.yaml`, ideally using a temporary file and atomic rename.
+Use `get_project_storage` to confirm the effective directory, including when packet capture was
+started with the legacy `projectPath` argument. After writing, call `validate_openapi_spec` for
+read-only structural checks; it reports parse errors, missing responses, and undeclared path
+parameters. It is not a complete OpenAPI schema validator.
+The OpenAPI Resource
+`burp-mcp://skills/openapi-from-packets` and prompt `build_openapi_from_packets` carry the method
+to other MCP clients, although a client must choose to read them. The example does not collect
+traffic or make requests to `cafe.naver.com` on its own.
 
 ## Manual installations
 If you want to install the MCP server manually you can either use the extension's SSE server directly or the packaged

@@ -1,0 +1,13 @@
+# Create or update OpenAPI from Burp packets
+
+Use the connected project's packet database as evidence. You, the agent, author the OpenAPI document; the Burp extension stores and displays it. Never infer a complete API from one response.
+
+1. Call `load_project_config` with the user-provided `config.yaml` path, then `start_packet_capture`. Use `get_project_storage`, `get_db_info`, and `get_db_schema` to confirm the effective directories and database. Do not choose a target or project path from observed traffic.
+2. Choose the host the user requested. For example, `cafe.naver.com` is only a host filter; it is not permission to send requests. Call `query_burp_database` with a stable `ORDER BY id`, bounded `maxRows`, and `offset` until `hasMore` is false. Start with metadata (`id`, `method`, `url`, `path`, `status_code`, body hashes), not all bodies. Filter `host = 'cafe.naver.com'` only when that is the requested host.
+3. Group captured packets by method and path shape. Keep the original URL and packet IDs as evidence. Treat numeric and UUID-like segments as possible variables; do not turn ordinary string segments into variables without multiple observed values at the same position.
+4. Call `list_openapi_specs` and `get_openapi_spec` for the host before editing. Preserve existing descriptions, operation IDs, tags, schemas, and manually reviewed choices unless packet evidence warrants a change.
+5. Read representative packets with `get_packet` or `save_packets`: different status codes, request body forms, and response shapes. Compare multiple samples before deciding required fields or path parameters. Do not copy authorization headers, cookies, tokens, or personal data into examples.
+6. Write or update OpenAPI 3.x with `servers` for the host, observed paths and methods, parameters, request bodies, and response status/schema variants. Mark uncertain conclusions in descriptions rather than inventing behavior. The result must reflect observed traffic, not an exhaustive API inventory.
+7. Write `<host>.yaml` into the configured `storage.openapi_dir`. Use a temporary file and rename it into place to avoid exposing a half-written YAML file. Call `validate_openapi_spec` for structural checks and fix reported errors. The Swagger tab reloads it automatically. If an existing file changed while editing, reread and reconcile before replacing it.
+
+For large databases, work in pages and inspect representative packets instead of sending every full body through the model. The agent and Burp extension run on the same PC and share the configured OpenAPI directory; the MCP server does not write the OpenAPI document.

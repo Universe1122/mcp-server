@@ -27,7 +27,7 @@ class SerializationTest {
         val stop = StopPacketCapture::class.asInputSchema(StopPacketCapture.serializer())
         val search = SearchPacket::class.asInputSchema(SearchPacket.serializer())
 
-        assertEquals(listOf("projectPath"), start.required)
+        assertTrue(start.required.orEmpty().isEmpty())
         assertTrue(stop.required.orEmpty().isEmpty())
         assertEquals(setOf("targets", "ftsSearchQuery"), search.required.orEmpty().toSet())
         assertFalse("limit" in search.required.orEmpty())

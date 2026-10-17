@@ -9,6 +9,9 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
@@ -79,6 +82,32 @@ data class PacketDetail(
 
 @Serializable
 data class DatabaseInfo(val status: CaptureStatus, val tables: Map<String, List<String>>)
+
+@Serializable
+data class DatabaseQueryPage(
+    val rows: List<Map<String, String?>>,
+    val offset: Int,
+    val limit: Int,
+    val hasMore: Boolean,
+    val nextOffset: Int?,
+)
+
+@Serializable
+data class DatabaseSchema(
+    val databasePath: String,
+    val createStatements: Map<String, String>,
+    val bodyStorage: String,
+)
+
+@Serializable
+data class HarExportResult(
+    val outputPath: String,
+    val exported: Int,
+    val lastId: Long?,
+    val hasMore: Boolean,
+    val skippedRequestBodies: Int,
+    val skippedResponseBodies: Int,
+)
 
 /** One database connection and one collector belong to the Burp extension, not to an MCP client. */
 class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
@@ -156,6 +185,9 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
     )
 
     @Synchronized
+    fun projectDirectory(): Path? = dbPath?.parent
+
+    @Synchronized
     fun count(): Long {
         val db = connection ?: return 0
         db.createStatement().use { st ->
@@ -174,6 +206,21 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             }
         }
         return DatabaseInfo(status(), tables)
+    }
+
+    @Synchronized
+    fun schema(): DatabaseSchema {
+        val db = requireDb()
+        val statements = linkedMapOf<String, String>()
+        db.prepareStatement("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('burp_packets','packet_blobs','packet_body_fts') ORDER BY name").use { st ->
+            st.executeQuery().use { rs -> while (rs.next()) statements[rs.getString("name")] = rs.getString("sql") }
+        }
+        return DatabaseSchema(
+            requireNotNull(dbPath).toString(), statements,
+            "burp_packets.request_body_hash/response_body_hash reference packet_blobs.hash; " +
+                "packet_blobs.data contains inline bytes, or file_path is relative to the database directory. " +
+                "request_head/response_head are raw HTTP header bytes without the body."
+        )
     }
 
     @Synchronized
@@ -322,20 +369,23 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
     }
 
     @Synchronized
-    fun querySelect(query: String, maxRows: Int): List<Map<String, String?>> {
+    fun querySelect(query: String, maxRows: Int, offset: Int = 0): DatabaseQueryPage {
         require(maxRows in 1..500) { "maxRows must be between 1 and 500" }
+        require(offset >= 0 && offset <= Int.MAX_VALUE - maxRows) { "offset must be non-negative and within range" }
         require(Regex("(?is)^\\s*select\\b").containsMatchIn(query) && !query.contains(';')) {
             "Only a single SELECT statement is allowed"
         }
         val path = dbPath ?: error("Packet database is not connected")
         DriverManager.getConnection("jdbc:sqlite:file:${path.toUri().rawPath}?mode=ro").use { reader ->
-            reader.createStatement().use { st ->
+            reader.prepareStatement("SELECT * FROM (\n$query\n) AS query_page LIMIT ? OFFSET ?").use { st ->
                 st.queryTimeout = 5
-                st.maxRows = maxRows
+                st.maxRows = maxRows + 1
                 st.maxFieldSize = 4096
-                st.executeQuery(query).use { rs ->
+                st.setInt(1, maxRows + 1)
+                st.setInt(2, offset)
+                st.executeQuery().use { rs ->
                     val metadata = rs.metaData
-                    return buildList {
+                    val rows = buildList {
                         while (rs.next()) add((1..metadata.columnCount).associate { column ->
                             metadata.getColumnLabel(column) to when (val value =
                                 if (metadata.getColumnType(column) == java.sql.Types.BLOB) "<BLOB; use get_packet or save_packets>"
@@ -346,6 +396,14 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                             }
                         })
                     }
+                    val hasMore = rows.size > maxRows
+                    return DatabaseQueryPage(
+                        rows = if (hasMore) rows.dropLast(1) else rows,
+                        offset = offset,
+                        limit = maxRows,
+                        hasMore = hasMore,
+                        nextOffset = if (hasMore) offset + maxRows else null,
+                    )
                 }
             }
         }
@@ -377,6 +435,114 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                     mapOf("packetId" to id.toString(), "requestPath" to requestFile.toString(), "responsePath" to (responseFile?.toString() ?: ""))
                 }
             }
+        }
+    }
+
+    /** Stream one bounded database page into a local HAR file for traffic-to-OpenAPI tools. */
+    @Synchronized
+    fun exportHar(
+        outputPath: String, host: String?, afterId: Long, limit: Int,
+        maxBodyBytes: Int, excludeMcpSent: Boolean,
+    ): HarExportResult {
+        require(afterId >= 0) { "afterId must be non-negative" }
+        require(limit in 1..5000) { "limit must be between 1 and 5000" }
+        require(maxBodyBytes in 0..1_048_576) { "maxBodyBytes must be between 0 and 1048576" }
+        require(host == null || host.isNotBlank()) { "host must be non-blank" }
+        val db = requireDb()
+        val output = Path.of(outputPath).toAbsolutePath().normalize()
+        require(output != dbPath) { "outputPath must not be the packet database" }
+        require(!Files.exists(output)) { "outputPath already exists: $output" }
+        Files.createDirectories(output.parent)
+        val temp = Files.createTempFile(output.parent, ".packets-har-", ".tmp")
+        var exported = 0
+        var lastId: Long? = null
+        var hasMore = false
+        var skippedRequests = 0
+        var skippedResponses = 0
+        val sql = """
+            SELECT p.id,p.method,p.url,p.status_code,p.request_head,p.response_head,p.captured_at,
+                   rq.size AS request_size,
+                   CASE WHEN rq.size <= ? THEN rq.data END AS request_data,
+                   CASE WHEN rq.size <= ? THEN rq.file_path END AS request_file,
+                   rs.size AS response_size,
+                   CASE WHEN rs.size <= ? THEN rs.data END AS response_data,
+                   CASE WHEN rs.size <= ? THEN rs.file_path END AS response_file
+            FROM burp_packets p
+            JOIN packet_blobs rq ON rq.hash=p.request_body_hash
+            LEFT JOIN packet_blobs rs ON rs.hash=p.response_body_hash
+            WHERE p.id > ? AND p.status_code IS NOT NULL
+            ${if (host != null) "AND p.host = ?" else ""}
+            ${if (excludeMcpSent) "AND p.is_sent_from_mcp = 0" else ""}
+            ORDER BY p.id LIMIT ?
+        """
+        try {
+            Files.newBufferedWriter(temp, StandardCharsets.UTF_8).use { writer ->
+                writer.write("{\"log\":{\"version\":\"1.2\",\"creator\":{\"name\":\"burp-mcp\",\"version\":\"1\"},\"entries\":[")
+                db.prepareStatement(sql).use { st ->
+                    repeat(4) { st.setInt(it + 1, maxBodyBytes) }
+                    st.setLong(5, afterId)
+                    var next = 6
+                    if (host != null) st.setString(next++, host)
+                    st.setInt(next, limit + 1)
+                    st.executeQuery().use { rs ->
+                        while (rs.next()) {
+                            if (exported == limit) { hasMore = true; break }
+                            val requestHead = rs.getBytes("request_head")
+                            val responseHead = rs.getBytes("response_head") ?: continue
+                            val requestHeaders = harHeaders(requestHead)
+                            val responseHeaders = harHeaders(responseHead)
+                            val requestBody = harBodyText(rs, "request", maxBodyBytes, requireNotNull(dbPath).parent)
+                            val responseBody = harBodyText(rs, "response", maxBodyBytes, requireNotNull(dbPath).parent)
+                            if (rs.getInt("request_size") > 0 && requestBody == null) skippedRequests++
+                            if ((rs.intOrNull("response_size") ?: 0) > 0 && responseBody == null) skippedResponses++
+                            val entry = buildJsonObject {
+                                put("startedDateTime", rs.getString("captured_at"))
+                                put("time", 0)
+                                put("request", buildJsonObject {
+                                    put("method", rs.getString("method"))
+                                    put("url", rs.getString("url"))
+                                    put("httpVersion", "HTTP/1.1")
+                                    put("headers", requestHeaders)
+                                    put("queryString", buildJsonArray { })
+                                    put("cookies", buildJsonArray { })
+                                    put("headersSize", requestHead.size)
+                                    put("bodySize", rs.getInt("request_size"))
+                                    if (requestBody != null) put("postData", buildJsonObject {
+                                        put("mimeType", harMimeType(requestHead))
+                                        put("text", requestBody)
+                                    })
+                                })
+                                put("response", buildJsonObject {
+                                    put("status", rs.getInt("status_code"))
+                                    put("statusText", harStatusText(responseHead))
+                                    put("httpVersion", "HTTP/1.1")
+                                    put("headers", responseHeaders)
+                                    put("cookies", buildJsonArray { })
+                                    put("content", buildJsonObject {
+                                        put("size", rs.intOrNull("response_size") ?: 0)
+                                        put("mimeType", harMimeType(responseHead))
+                                        if (responseBody != null) put("text", responseBody)
+                                    })
+                                    put("redirectURL", "")
+                                    put("headersSize", responseHead.size)
+                                    put("bodySize", rs.intOrNull("response_size") ?: 0)
+                                })
+                                put("cache", buildJsonObject { })
+                                put("timings", buildJsonObject { put("send", 0); put("wait", 0); put("receive", 0) })
+                            }
+                            if (exported > 0) writer.write(",")
+                            writer.write(Json.encodeToString(JsonObject.serializer(), entry))
+                            exported++
+                            lastId = rs.getLong("id")
+                        }
+                    }
+                }
+                writer.write("]}}")
+            }
+            Files.move(temp, output)
+            return HarExportResult(output.toString(), exported, lastId, hasMore, skippedRequests, skippedResponses)
+        } finally {
+            Files.deleteIfExists(temp)
         }
     }
 
@@ -606,6 +772,38 @@ private fun ResultSet.summary() = PacketSummary(
     getInt("request_size"), intOrNull("response_size"), getInt("is_sent_from_mcp") != 0,
     getString("snippet"), getInt("similar_count")
 )
+private fun harBodyText(rs: ResultSet, kind: String, maxBodyBytes: Int, project: Path): String? {
+    val size = rs.intOrNull("${kind}_size") ?: return null
+    if (size == 0 || size > maxBodyBytes) return null
+    val inline = rs.getBytes("${kind}_data")
+    val relative = rs.getString("${kind}_file")
+    val bytes = inline ?: relative?.let { Files.readAllBytes(project.resolve(it)) } ?: return null
+    require(bytes.size == size) { "Stored $kind body size does not match packet_blobs.size" }
+    return try {
+        StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+            .decode(ByteBuffer.wrap(bytes)).toString().takeIf { '\u0000' !in it }
+    } catch (_: CharacterCodingException) { null }
+}
+private fun harHeaderLines(head: ByteArray): List<String> =
+    String(head, StandardCharsets.ISO_8859_1).split(Regex("\\r?\\n")).drop(1)
+
+private fun harHeaders(head: ByteArray) = buildJsonArray {
+    harHeaderLines(head).forEach { line ->
+        val separator = line.indexOf(':')
+        if (separator > 0) add(buildJsonObject {
+            put("name", line.substring(0, separator))
+            put("value", line.substring(separator + 1).trim())
+        })
+    }
+}
+private fun harMimeType(head: ByteArray): String = harHeaderLines(head)
+    .firstOrNull { it.startsWith("Content-Type:", ignoreCase = true) }
+    ?.substringAfter(':')?.trim()?.substringBefore(';') ?: "application/octet-stream"
+
+private fun harStatusText(head: ByteArray): String = String(head, StandardCharsets.ISO_8859_1)
+    .lineSequence().firstOrNull()?.trimEnd('\r')?.split(' ', limit = 3)?.getOrNull(2) ?: ""
+
 private fun ByteArray.takeBytes(max: Int) = copyOfRange(0, size.coerceAtMost(max))
 private fun ByteArray.base64(): String = java.util.Base64.getEncoder().encodeToString(this)
 private fun escapeLike(value: String) = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
