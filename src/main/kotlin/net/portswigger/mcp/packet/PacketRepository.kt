@@ -2,10 +2,17 @@ package net.portswigger.mcp.packet
 
 import burp.api.montoya.MontoyaApi
 import burp.api.montoya.core.ByteArray as BurpByteArray
+import burp.api.montoya.core.Registration
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.proxy.ProxyHttpRequestResponse
+import burp.api.montoya.proxy.http.InterceptedResponse
+import burp.api.montoya.proxy.http.ProxyResponseHandler
+import burp.api.montoya.proxy.http.ProxyResponseReceivedAction
+import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -25,14 +32,21 @@ import java.sql.Connection
 import java.sql.DriverManager
 import java.sql.ResultSet
 import java.time.Instant
+import java.util.Base64
+import java.util.UUID
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.CopyOnWriteArrayList
 
 private const val DATABASE_FILE = "packets.sqlite3"
 private const val INLINE_BLOB_LIMIT = 16 * 1024 * 1024
 private const val FTS_PREFIX_LIMIT = 4 * 1024 * 1024
 private const val COPY_CHUNK = 262_144
+private const val METADATA_TEXT_LIMIT = 4096
+private const val RESPONSE_QUEUE_LIMIT = 256
 
 @Serializable
 data class CaptureStatus(
@@ -42,6 +56,15 @@ data class CaptureStatus(
     val historyPosition: Int,
     val scanned: Int = 0,
     val inserted: Int = 0,
+    val historyScanPhase: String = "idle",
+    val historyScanTotal: Int = 0,
+    val historyScanProcessed: Int = 0,
+    val historyScanInserted: Int = 0,
+    val queueOverflowCount: Long = 0,
+    val pendingResponseCount: Int = 0,
+    val saveFailureCount: Long = 0,
+    val historyCatchupCount: Long = 0,
+    val lastCaptureError: String? = null,
 )
 
 @Serializable
@@ -109,20 +132,116 @@ data class HarExportResult(
     val skippedResponseBodies: Int,
 )
 
-/** One database connection and one collector belong to the Burp extension, not to an MCP client. */
+@Serializable
+data class PacketDeltaItem(
+    val id: Long,
+    val host: String,
+    val method: String,
+    val path: String,
+    val url: String,
+    val statusCode: Int?,
+    val requestBodySize: Int,
+    val responseBodySize: Int?,
+    val isSentFromMcp: Boolean,
+    val capturedAt: String,
+    val pathTruncated: Boolean,
+    val urlTruncated: Boolean,
+    val changeSeq: Long? = null,
+    val changeKind: String? = null,
+)
+
+@Serializable
+data class PacketDeltaPage(
+    val databasePath: String,
+    val databaseId: String,
+    val afterId: Long,
+    val items: List<PacketDeltaItem>,
+    val lastId: Long,
+    val hasMore: Boolean,
+    val afterChangeSeq: Long? = null,
+    val lastChangeSeq: Long? = null,
+)
+
+@Serializable
+data class ApiRouteSummary(
+    val host: String,
+    val method: String,
+    val path: String,
+    val packetCount: Long,
+    val firstPacketId: Long,
+    val lastPacketId: Long,
+    val firstSeen: String,
+    val lastSeen: String,
+    val statusCodes: List<Int>,
+    val hasQuery: Boolean,
+    val hasRequestBody: Boolean,
+    val sampleResponseMimeType: String?,
+    val sampleUrl: String,
+    val pathTruncated: Boolean,
+    val sampleUrlTruncated: Boolean,
+)
+
+@Serializable
+data class ApiInventoryPage(
+    val databasePath: String,
+    val databaseId: String,
+    val host: String,
+    val snapshotMaxId: Long,
+    val routes: List<ApiRouteSummary>,
+    val hasMore: Boolean,
+    val nextCursor: String?,
+)
+
+@Serializable
+private data class InventoryCursor(
+    val databaseId: String,
+    val host: String,
+    val excludeMcpSent: Boolean,
+    val snapshotMaxId: Long,
+    val lastFirstPacketId: Long,
+)
+
+/** One writer and one collector belong to the Burp extension; long reads use separate SQLite connections. */
 class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
-    private val executor = Executors.newSingleThreadScheduledExecutor { work ->
+    private val executor = Executors.newSingleThreadExecutor { work ->
         Thread(work, "burp-mcp-packet-collector").apply { isDaemon = true }
     }
-    private var future: ScheduledFuture<*>? = null
+    private var responseRegistration: Registration? = null
+    private val pendingResponses = ArrayBlockingQueue<QueuedResponse>(RESPONSE_QUEUE_LIMIT)
+    private val drainingResponses = AtomicBoolean(false)
+    private val needsHistoryCatchup = AtomicBoolean(false)
+    private val queueOverflowCount = AtomicLong()
+    private val saveFailureCount = AtomicLong()
+    private val historyCatchupCount = AtomicLong()
+    private val inventoryListeners = CopyOnWriteArrayList<() -> Unit>()
+    @Volatile private var captureGeneration = 0L
+    @Volatile private var collecting = false
+    @Volatile private var historyScanPhase = "idle"
+    @Volatile private var historyScanTotal = 0
+    @Volatile private var historyScanProcessed = 0
+    @Volatile private var historyScanInserted = 0
+    @Volatile private var lastCaptureError: String? = null
     private var connection: Connection? = null
     private var dbPath: Path? = null
     private var historyPosition = 0
     private var lastHistoryId: Int? = null
     private val pendingResponsePositions = mutableSetOf<Int>()
 
+    private data class QueuedResponse(
+        val request: HttpRequest, val response: HttpResponse, val burpId: Int, val generation: Long,
+    )
+
+    fun addInventoryListener(listener: () -> Unit): AutoCloseable {
+        inventoryListeners.add(listener)
+        return AutoCloseable { inventoryListeners.remove(listener) }
+    }
+
+    private fun notifyInventoryChanged() {
+        inventoryListeners.forEach { listener -> runCatching { listener() }.onFailure { api.logging().logToError(it) } }
+    }
+
     @Synchronized
-    fun start(projectPath: String): CaptureStatus {
+    fun start(projectPath: String, backgroundScan: Boolean = false): CaptureStatus {
         val project = Path.of(projectPath).toRealPath()
         require(Files.isDirectory(project)) { "projectPath must be an existing directory" }
         val path = project.resolve(DATABASE_FILE)
@@ -134,6 +253,14 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         historyPosition = 0
         lastHistoryId = null
         pendingResponsePositions.clear()
+        historyScanPhase = "idle"
+        historyScanTotal = 0
+        historyScanProcessed = 0
+        historyScanInserted = 0
+        lastCaptureError = null
+        queueOverflowCount.set(0)
+        saveFailureCount.set(0)
+        historyCatchupCount.set(0)
 
         Class.forName("org.sqlite.JDBC")
         val opened = DriverManager.getConnection("jdbc:sqlite:${path}")
@@ -146,14 +273,25 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             initialize(opened)
             connection = opened
             dbPath = path
+            notifyInventoryChanged()
+            collecting = true
+            val generation = captureGeneration
+            responseRegistration = api.proxy().registerResponseHandler(responseHandler(generation))
             // Every connection deliberately scans Burp history from the beginning.
+            if (backgroundScan) {
+                historyScanPhase = "loading_history"
+                executor.execute { syncHistoryProgressive(generation) }
+                return status()
+            }
+            historyScanPhase = "scanning"
             val scanned = syncHistory()
-            future = executor.scheduleWithFixedDelay({
-                try { synchronized(this) { if (connection != null) syncHistory() } }
-                catch (error: Exception) { api.logging().logToError(error) }
-            }, 5, 5, TimeUnit.SECONDS)
+            historyScanTotal = historyPosition
+            historyScanProcessed = historyPosition
+            historyScanInserted = scanned.second
+            historyScanPhase = "complete"
             return status(scanned.first, scanned.second)
         } catch (error: Exception) {
+            stopCollection()
             connection = null
             dbPath = null
             opened.close()
@@ -175,13 +313,16 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 historyPosition = 0
                 lastHistoryId = null
                 pendingResponsePositions.clear()
+                notifyInventoryChanged()
             }
         }
     }
 
     @Synchronized
     fun status(scanned: Int = 0, inserted: Int = 0): CaptureStatus = CaptureStatus(
-        dbPath?.toString(), future?.isCancelled == false, count(), historyPosition, scanned, inserted
+        dbPath?.toString(), collecting, count(), historyPosition, scanned, inserted,
+        historyScanPhase, historyScanTotal, historyScanProcessed, historyScanInserted,
+        queueOverflowCount.get(), pendingResponses.size, saveFailureCount.get(), historyCatchupCount.get(), lastCaptureError
     )
 
     @Synchronized
@@ -198,7 +339,10 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
     @Synchronized
     fun info(): DatabaseInfo {
         val db = connection ?: return DatabaseInfo(status(), emptyMap())
-        val tables = listOf("burp_packets", "packet_blobs", "packet_body_fts").associateWith { name ->
+        val tables = listOf(
+            "burp_packets", "packet_blobs", "packet_body_fts",
+            "api_route_summary", "api_route_status_codes", "packet_changes",
+        ).associateWith { name ->
             db.createStatement().use { st ->
                 st.executeQuery("PRAGMA table_info($name)").use { rs ->
                     buildList { while (rs.next()) add(rs.getString("name")) }
@@ -212,7 +356,12 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
     fun schema(): DatabaseSchema {
         val db = requireDb()
         val statements = linkedMapOf<String, String>()
-        db.prepareStatement("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('burp_packets','packet_blobs','packet_body_fts') ORDER BY name").use { st ->
+        db.prepareStatement("""
+            SELECT name, sql FROM sqlite_master
+            WHERE type='table' AND name IN
+              ('burp_packets','packet_blobs','packet_body_fts','api_route_summary','api_route_status_codes','packet_changes')
+            ORDER BY name
+        """).use { st ->
             st.executeQuery().use { rs -> while (rs.next()) statements[rs.getString("name")] = rs.getString("sql") }
         }
         return DatabaseSchema(
@@ -275,13 +424,150 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
     fun hosts(): List<String> {
         val db = requireDb()
         db.createStatement().use { st ->
-            st.executeQuery("SELECT DISTINCT host FROM burp_packets ORDER BY host").use { rs ->
+            st.executeQuery("SELECT DISTINCT host FROM api_route_summary WHERE scope=0 ORDER BY host").use { rs ->
                 return buildList { while (rs.next()) add(rs.getString(1)) }
             }
         }
     }
 
+    /** Cheap change marker for the all-packets inventory shown in the Burp tab. */
     @Synchronized
+    fun inventoryRevision(): Pair<String, Long>? {
+        val db = connection ?: return null
+        val lastId = db.createStatement().use { st ->
+            st.executeQuery("SELECT COALESCE(MAX(seq),0) FROM packet_changes").use { rs -> rs.next(); rs.getLong(1) }
+        }
+        return databaseId(db) to lastId
+    }
+
+    /** Return packet metadata in insertion order. The lastId is safe to reuse after a Burp restart. */
+    @Synchronized
+    fun packetDelta(afterId: Long, limit: Int, host: String?, excludeMcpSent: Boolean,
+                    expectedDatabaseId: String?, afterChangeSeq: Long? = null): PacketDeltaPage {
+        require(afterId >= 0) { "afterId must be non-negative" }
+        require(afterChangeSeq == null || afterChangeSeq >= 0) { "afterChangeSeq must be non-negative" }
+        require(limit in 1..500) { "limit must be between 1 and 500" }
+        require(host == null || host.isNotBlank()) { "host must be non-blank" }
+        val db = requireDb()
+        val identity = databaseId(db)
+        require(expectedDatabaseId == null || expectedDatabaseId == identity) {
+            "Packet database has changed; restart from afterChangeSeq=0"
+        }
+        val journal = afterChangeSeq != null
+        val sql = """
+            SELECT p.id,p.host,p.method,p.path,p.url,p.status_code,p.is_sent_from_mcp,p.captured_at,
+                   ${if (journal) "c.seq AS change_seq,c.kind AS change_kind" else "NULL AS change_seq,NULL AS change_kind"},
+                   rq.size AS request_size,rs.size AS response_size
+            FROM burp_packets p
+            ${if (journal) "JOIN packet_changes c ON c.packet_id=p.id" else ""}
+            JOIN packet_blobs rq ON rq.hash=p.request_body_hash
+            LEFT JOIN packet_blobs rs ON rs.hash=p.response_body_hash
+            WHERE ${if (journal) "c.seq" else "p.id"} > ?
+            ${if (host != null) "AND p.host = ?" else ""}
+            ${if (journal) {
+                if (excludeMcpSent) "AND c.is_sent_from_mcp=0" else "AND c.kind='insert'"
+            } else if (excludeMcpSent) "AND p.is_sent_from_mcp = 0" else ""}
+            ORDER BY ${if (journal) "c.seq" else "p.id"} LIMIT ?
+        """
+        val results = db.prepareStatement(sql).use { st ->
+            st.setLong(1, afterChangeSeq ?: afterId)
+            var index = 2
+            if (host != null) st.setString(index++, host)
+            st.setInt(index, limit + 1)
+            st.executeQuery().use { rs -> buildList {
+                while (rs.next()) add(PacketDeltaItem(
+                    rs.getLong("id"), rs.getString("host"), rs.getString("method"),
+                    boundedMetadata(rs.getString("path")), boundedMetadata(rs.getString("url")),
+                    rs.intOrNull("status_code"),
+                    rs.getInt("request_size"), rs.intOrNull("response_size"),
+                    rs.getInt("is_sent_from_mcp") != 0, rs.getString("captured_at"),
+                    rs.getString("path").length > METADATA_TEXT_LIMIT,
+                    rs.getString("url").length > METADATA_TEXT_LIMIT,
+                    rs.getLong("change_seq").let { if (rs.wasNull()) null else it },
+                    rs.getString("change_kind"),
+                ))
+            } }
+        }
+        val hasMore = results.size > limit
+        val items = if (hasMore) results.dropLast(1) else results
+        // A filtered page with no further matches can still advance past non-matching packets.
+        val lastId = if (hasMore) items.last().id else db.createStatement().use { st ->
+            st.executeQuery("SELECT COALESCE(MAX(id),0) FROM burp_packets").use { rs ->
+                rs.next()
+                maxOf(afterId, rs.getLong(1))
+            }
+        }
+        val lastChangeSeq = if (!journal) null else if (hasMore) items.last().changeSeq else
+            db.createStatement().use { st ->
+                st.executeQuery("SELECT COALESCE(MAX(seq),0) FROM packet_changes").use { rs ->
+                    rs.next(); maxOf(afterChangeSeq, rs.getLong(1))
+                }
+            }
+        return PacketDeltaPage(requireNotNull(dbPath).toString(), identity, afterId, items,
+            lastId, hasMore, afterChangeSeq, lastChangeSeq)
+    }
+
+    /** Page exact observed routes from the incrementally maintained summary table. */
+    @Synchronized
+    fun apiInventory(host: String, limit: Int, cursor: String?, excludeMcpSent: Boolean): ApiInventoryPage {
+        require(host.isNotBlank()) { "host is required" }
+        require(limit in 1..500) { "limit must be between 1 and 500" }
+        val db = requireDb()
+        val identity = databaseId(db)
+        val decoded = cursor?.let {
+            require(it.length <= 4096) { "cursor is too long" }
+            runCatching { Json.decodeFromString<InventoryCursor>(String(Base64.getUrlDecoder().decode(it), StandardCharsets.UTF_8)) }
+                .getOrElse { throw IllegalArgumentException("Invalid inventory cursor", it) }
+        }
+        require(decoded == null || (decoded.databaseId == identity && decoded.host == host &&
+            decoded.excludeMcpSent == excludeMcpSent)) { "Inventory cursor belongs to another database or filter" }
+        val snapshotMaxId = decoded?.snapshotMaxId ?: db.createStatement().use { st ->
+            st.executeQuery("SELECT COALESCE(MAX(id),0) FROM burp_packets").use { rs -> rs.next(); rs.getLong(1) }
+        }
+        val sql = """
+            SELECT s.*,
+                   (SELECT group_concat(code) FROM api_route_status_codes c
+                    WHERE c.scope=s.scope AND c.host=s.host AND c.method=s.method
+                      AND c.route_path=s.route_path) AS status_codes,
+                   sample.url AS sample_url,sample.response_head AS sample_response_head
+            FROM api_route_summary s JOIN burp_packets sample ON sample.id=s.first_id
+            WHERE s.host=? AND s.scope=? AND s.first_id<=? AND s.first_id>?
+            ORDER BY s.first_id LIMIT ?
+        """
+        val results = db.prepareStatement(sql).use { st ->
+            st.setString(1, host)
+            st.setInt(2, if (excludeMcpSent) 1 else 0)
+            st.setLong(3, snapshotMaxId)
+            st.setLong(4, decoded?.lastFirstPacketId ?: 0)
+            st.setInt(5, limit + 1)
+            st.executeQuery().use { rs -> buildList {
+                while (rs.next()) add(ApiRouteSummary(
+                    host, rs.getString("method"), boundedMetadata(rs.getString("route_path")),
+                    rs.getLong("packet_count"), rs.getLong("first_id"), rs.getLong("last_id"),
+                    rs.getString("first_seen"), rs.getString("last_seen"),
+                    rs.getString("status_codes")?.split(',')?.mapNotNull(String::toIntOrNull)?.distinct()?.sorted() ?: emptyList(),
+                    rs.getInt("has_query") != 0, rs.getInt("has_request_body") != 0,
+                    responseMimeType(rs.getBytes("sample_response_head")), boundedMetadata(rs.getString("sample_url")),
+                    rs.getString("route_path").length > METADATA_TEXT_LIMIT,
+                    rs.getString("sample_url").length > METADATA_TEXT_LIMIT,
+                ))
+            } }
+        }
+        val hasMore = results.size > limit
+        val routes = if (hasMore) results.dropLast(1) else results
+        val nextCursor = if (hasMore) routes.lastOrNull()?.let {
+            Base64.getUrlEncoder().withoutPadding().encodeToString(Json.encodeToString(
+                InventoryCursor(identity, host, excludeMcpSent, snapshotMaxId, it.firstPacketId)
+            ).toByteArray(StandardCharsets.UTF_8))
+        } else null
+        return ApiInventoryPage(requireNotNull(dbPath).toString(), identity, host, snapshotMaxId,
+            routes, hasMore, nextCursor)
+    }
+
+    private fun databaseId(db: Connection): String = db.prepareStatement(
+        "SELECT value FROM capture_metadata WHERE key='database_id'"
+    ).use { st -> st.executeQuery().use { rs -> rs.next(); rs.getString(1) } }
+
     fun search(
         query: String, targets: List<String>, hosts: List<String>, url: String?, method: String?,
         statusCode: Int?, excludeMcpSent: Boolean, groupSimilar: Boolean, limit: Int, offset: Int,
@@ -291,7 +577,8 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             "targets must contain request_body or response_body"
         }
         require(limit in 1..500 && offset >= 0) { "limit must be 1..500 and offset non-negative" }
-        val db = requireDb()
+        val db = openReader()
+        db.use { reader ->
         val targetCondition = targets.joinToString(" OR ") {
             if (it == "request_body") "p.request_body_hash = h.hash" else "p.response_body_hash = h.hash"
         }
@@ -323,7 +610,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             if (groupSimilar) append(" WHERE group_rank=1")
             append(" ORDER BY id LIMIT ? OFFSET ?")
         }
-        db.prepareStatement(sql).use { st ->
+        reader.prepareStatement(sql).use { st ->
             var i = 1
             st.setString(i++, query)
             hosts.forEach { st.setString(i++, it) }
@@ -333,6 +620,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             st.setInt(i++, limit)
             st.setInt(i, offset)
             st.executeQuery().use { rs -> return buildList { while (rs.next()) add(rs.summary()) } }
+        }
         }
     }
 
@@ -368,14 +656,13 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         }
     }
 
-    @Synchronized
     fun querySelect(query: String, maxRows: Int, offset: Int = 0): DatabaseQueryPage {
         require(maxRows in 1..500) { "maxRows must be between 1 and 500" }
         require(offset >= 0 && offset <= Int.MAX_VALUE - maxRows) { "offset must be non-negative and within range" }
         require(Regex("(?is)^\\s*select\\b").containsMatchIn(query) && !query.contains(';')) {
             "Only a single SELECT statement is allowed"
         }
-        val path = dbPath ?: error("Packet database is not connected")
+        val path = synchronized(this) { dbPath ?: error("Packet database is not connected") }
         DriverManager.getConnection("jdbc:sqlite:file:${path.toUri().rawPath}?mode=ro").use { reader ->
             reader.prepareStatement("SELECT * FROM (\n$query\n) AS query_page LIMIT ? OFFSET ?").use { st ->
                 st.queryTimeout = 5
@@ -409,13 +696,12 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         }
     }
 
-    @Synchronized
     fun savePackets(ids: List<Long>, directory: String): List<Map<String, String>> {
         require(ids.isNotEmpty() && ids.size <= 100) { "packetIds must contain 1..100 ids" }
         val target = Path.of(directory).toAbsolutePath().normalize()
         Files.createDirectories(target)
-        val db = requireDb()
-        return ids.map { id ->
+        val databasePath = synchronized(this) { dbPath ?: error("Packet database is not connected") }
+        return DriverManager.getConnection("jdbc:sqlite:file:${databasePath.toUri().rawPath}?mode=ro").use { db -> ids.map { id ->
             db.prepareStatement("""
                 SELECT p.request_head,p.response_head,rq.data AS request_body,rq.file_path AS request_body_path,
                        rs.data AS response_body,rs.file_path AS response_body_path
@@ -426,20 +712,19 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 st.executeQuery().use { rs ->
                     require(rs.next()) { "Packet $id does not exist" }
                     val requestFile = target.resolve("$id.request.raw")
-                    writeMessage(requestFile, rs.getBytes("request_head"), rs.getBytes("request_body"), rs.getString("request_body_path"))
+                    writeMessage(requestFile, rs.getBytes("request_head"), rs.getBytes("request_body"), rs.getString("request_body_path"), databasePath.parent)
                     val responseFile = rs.getBytes("response_head")?.let { head ->
                         target.resolve("$id.response.raw").also {
-                            writeMessage(it, head, rs.getBytes("response_body"), rs.getString("response_body_path"))
+                            writeMessage(it, head, rs.getBytes("response_body"), rs.getString("response_body_path"), databasePath.parent)
                         }
                     }
                     mapOf("packetId" to id.toString(), "requestPath" to requestFile.toString(), "responsePath" to (responseFile?.toString() ?: ""))
                 }
             }
-        }
+        } }
     }
 
     /** Stream one bounded database page into a local HAR file for traffic-to-OpenAPI tools. */
-    @Synchronized
     fun exportHar(
         outputPath: String, host: String?, afterId: Long, limit: Int,
         maxBodyBytes: Int, excludeMcpSent: Boolean,
@@ -448,9 +733,9 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         require(limit in 1..5000) { "limit must be between 1 and 5000" }
         require(maxBodyBytes in 0..1_048_576) { "maxBodyBytes must be between 0 and 1048576" }
         require(host == null || host.isNotBlank()) { "host must be non-blank" }
-        val db = requireDb()
+        val databasePath = synchronized(this) { dbPath ?: error("Packet database is not connected") }
         val output = Path.of(outputPath).toAbsolutePath().normalize()
-        require(output != dbPath) { "outputPath must not be the packet database" }
+        require(output != databasePath) { "outputPath must not be the packet database" }
         require(!Files.exists(output)) { "outputPath already exists: $output" }
         Files.createDirectories(output.parent)
         val temp = Files.createTempFile(output.parent, ".packets-har-", ".tmp")
@@ -476,6 +761,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             ORDER BY p.id LIMIT ?
         """
         try {
+            DriverManager.getConnection("jdbc:sqlite:file:${databasePath.toUri().rawPath}?mode=ro").use { db ->
             Files.newBufferedWriter(temp, StandardCharsets.UTF_8).use { writer ->
                 writer.write("{\"log\":{\"version\":\"1.2\",\"creator\":{\"name\":\"burp-mcp\",\"version\":\"1\"},\"entries\":[")
                 db.prepareStatement(sql).use { st ->
@@ -491,8 +777,8 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                             val responseHead = rs.getBytes("response_head") ?: continue
                             val requestHeaders = harHeaders(requestHead)
                             val responseHeaders = harHeaders(responseHead)
-                            val requestBody = harBodyText(rs, "request", maxBodyBytes, requireNotNull(dbPath).parent)
-                            val responseBody = harBodyText(rs, "response", maxBodyBytes, requireNotNull(dbPath).parent)
+                            val requestBody = harBodyText(rs, "request", maxBodyBytes, databasePath.parent)
+                            val responseBody = harBodyText(rs, "response", maxBodyBytes, databasePath.parent)
                             if (rs.getInt("request_size") > 0 && requestBody == null) skippedRequests++
                             if ((rs.intOrNull("response_size") ?: 0) > 0 && responseBody == null) skippedResponses++
                             val entry = buildJsonObject {
@@ -539,6 +825,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 }
                 writer.write("]}}")
             }
+            }
             Files.move(temp, output)
             return HarExportResult(output.toString(), exported, lastId, hasMore, skippedRequests, skippedResponses)
         } finally {
@@ -552,11 +839,150 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         connection?.close()
         connection = null
         dbPath = null
+        notifyInventoryChanged()
         executor.shutdownNow()
     }
 
-    private fun stopCollection() { future?.cancel(false); future = null }
+    private fun stopCollection() {
+        val previousGeneration = captureGeneration
+        collecting = false
+        captureGeneration++
+        responseRegistration?.deregister()
+        responseRegistration = null
+        while (true) {
+            val queued = pendingResponses.poll() ?: break
+            if (queued.generation == previousGeneration && connection != null) {
+                try { save(queued.request, queued.response, queued.burpId, false) }
+                catch (error: Exception) { recordSaveFailure(error) }
+            }
+        }
+        needsHistoryCatchup.set(false)
+    }
+
+    private fun responseHandler(generation: Long) = object : ProxyResponseHandler {
+        override fun handleResponseReceived(response: InterceptedResponse): ProxyResponseReceivedAction =
+            ProxyResponseReceivedAction.continueWith(response)
+
+        override fun handleResponseToBeSent(response: InterceptedResponse): ProxyResponseToBeSentAction {
+            try {
+                if (collecting && generation == captureGeneration) {
+                    val queued = QueuedResponse(response.request(), response, response.messageId(), generation)
+                    if (!pendingResponses.offer(queued)) {
+                        queueOverflowCount.incrementAndGet()
+                        needsHistoryCatchup.set(true)
+                    }
+                    scheduleResponseDrain()
+                }
+            } catch (error: Exception) {
+                needsHistoryCatchup.set(true)
+                recordSaveFailure(error)
+                scheduleResponseDrain()
+            }
+            return ProxyResponseToBeSentAction.continueWith(response)
+        }
+    }
+
+    private fun scheduleResponseDrain() {
+        if (!drainingResponses.compareAndSet(false, true)) return
+        try {
+            executor.execute {
+                try {
+                    while (true) {
+                        val hadItem = synchronized(this) {
+                            val queued = pendingResponses.poll() ?: return@synchronized false
+                            if (collecting && queued.generation == captureGeneration && connection != null) {
+                                try { save(queued.request, queued.response, queued.burpId, false) }
+                                catch (error: Exception) {
+                                    needsHistoryCatchup.set(true)
+                                    recordSaveFailure(error)
+                                }
+                            }
+                            true
+                        }
+                        if (!hadItem) break
+                    }
+                    if (needsHistoryCatchup.getAndSet(false)) {
+                        synchronized(this) {
+                            if (collecting && connection != null) {
+                                try {
+                                    historyCatchupCount.incrementAndGet()
+                                    syncHistory()
+                                    if (historyScanPhase == "error") historyScanPhase = "complete"
+                                    lastCaptureError = null
+                                }
+                                catch (error: Exception) { recordSaveFailure(error) }
+                            }
+                        }
+                    }
+                } finally {
+                    drainingResponses.set(false)
+                    if (pendingResponses.isNotEmpty() || needsHistoryCatchup.get()) scheduleResponseDrain()
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            drainingResponses.set(false)
+        }
+    }
+
     private fun requireDb(): Connection = connection ?: error("Packet database is not connected; call start_packet_capture first")
+
+    private fun openReader(): Connection {
+        val path = synchronized(this) { dbPath ?: error("Packet database is not connected") }
+        return DriverManager.getConnection("jdbc:sqlite:file:${path.toUri().rawPath}?mode=ro").apply {
+            createStatement().use { it.execute("PRAGMA busy_timeout=5000") }
+        }
+    }
+
+    private fun recordSaveFailure(error: Exception) {
+        saveFailureCount.incrementAndGet()
+        lastCaptureError = "${error.javaClass.simpleName}: ${error.message}"
+        api.logging().logToError(error)
+    }
+
+    /** Load the History snapshot off the MCP thread and release the repository lock after each item. */
+    private fun syncHistoryProgressive(generation: Long) {
+        try {
+            val history = api.proxy().history()
+            synchronized(this) {
+                if (generation != captureGeneration || connection == null) return
+                historyScanTotal = history.size
+                historyScanPhase = "scanning"
+                if (history.size < historyPosition ||
+                    (historyPosition > 0 && history[historyPosition - 1].id() != lastHistoryId)) {
+                    historyPosition = 0
+                    lastHistoryId = null
+                    pendingResponsePositions.clear()
+                }
+            }
+            for (position in history.indices) {
+                synchronized(this) {
+                    if (generation != captureGeneration || connection == null) return
+                    val item = history[position]
+                    if (position < historyPosition) {
+                        if (position in pendingResponsePositions && item.response() != null) {
+                            if (saveHistoryItem(item, position) != null) historyScanInserted++
+                            pendingResponsePositions.remove(position)
+                        }
+                    } else {
+                        if (item.response() == null) pendingResponsePositions.add(position)
+                        else if (saveHistoryItem(item, position) != null) historyScanInserted++
+                        lastHistoryId = item.id()
+                        historyPosition = position + 1
+                    }
+                    historyScanProcessed = position + 1
+                }
+            }
+            synchronized(this) {
+                if (generation == captureGeneration) historyScanPhase = "complete"
+            }
+        } catch (error: Exception) {
+            historyScanPhase = "error"
+            needsHistoryCatchup.set(true)
+            recordSaveFailure(error)
+        } finally {
+            if (generation == captureGeneration) scheduleResponseDrain()
+        }
+    }
 
     private fun blobPath(hash: String): Path = requireNotNull(dbPath).parent.resolve("raw/resources/mcp-server/blobs/$hash.bin")
 
@@ -566,13 +992,13 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         else -> error("Stored body has neither inline data nor a file")
     }
 
-    private fun writeMessage(output: Path, head: ByteArray, inline: ByteArray?, relativePath: String?) {
+    private fun writeMessage(output: Path, head: ByteArray, inline: ByteArray?, relativePath: String?, project: Path) {
         Files.newOutputStream(output, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING).use { stream ->
             stream.write(head)
             stream.write("\r\n\r\n".toByteArray())
             when {
                 inline != null -> stream.write(inline)
-                relativePath != null -> Files.newInputStream(requireNotNull(dbPath).parent.resolve(relativePath)).use { it.copyTo(stream) }
+                relativePath != null -> Files.newInputStream(project.resolve(relativePath)).use { it.copyTo(stream) }
                 else -> error("Stored body has neither inline data nor a file")
             }
         }
@@ -626,14 +1052,15 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         val responseHash = responseBody?.let(::hashBody)
         val service = request.httpService()
         val fingerprint = packetHash(service.host(), service.port(), service.secure(), requestHead, requestHash, responseHead, responseHash)
-        db.prepareStatement("SELECT id FROM burp_packets WHERE fingerprint=?").use { st ->
+        db.prepareStatement("SELECT id,is_sent_from_mcp FROM burp_packets WHERE fingerprint=?").use { st ->
             st.setString(1, fingerprint)
             st.executeQuery().use { rs -> if (rs.next()) {
                 // A request sent through MCP may later be observed in Proxy. Keep the observed origin.
-                if (!sent) db.prepareStatement("UPDATE burp_packets SET is_sent_from_mcp=0,burp_id=COALESCE(burp_id,?) WHERE id=?").use { update ->
+                if (!sent && rs.getInt("is_sent_from_mcp") != 0) db.prepareStatement("UPDATE burp_packets SET is_sent_from_mcp=0,burp_id=COALESCE(burp_id,?) WHERE id=?").use { update ->
                     if (burpId == null) update.setNull(1, java.sql.Types.INTEGER) else update.setInt(1, burpId)
                     update.setLong(2, rs.getLong(1))
                     update.executeUpdate()
+                    notifyInventoryChanged()
                 }
                 return null
             } }
@@ -661,6 +1088,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 }
                 val id = st.generatedKeys.use { rs -> if (rs.next()) rs.getLong(1) else null }
                 db.commit()
+                notifyInventoryChanged()
                 return id
             }
         } catch (error: Exception) {
@@ -762,11 +1190,24 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             st.execute("CREATE INDEX IF NOT EXISTS idx_packets_url ON burp_packets(url)")
             st.execute("CREATE INDEX IF NOT EXISTS idx_packets_referer ON burp_packets(referer)")
             st.execute("CREATE VIRTUAL TABLE IF NOT EXISTS packet_body_fts USING fts5(body_text,tokenize='trigram')")
+            st.execute("CREATE TABLE IF NOT EXISTS capture_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+            // The former Python collector left this INSERT trigger on some databases after
+            // their packet table was migrated. It references columns absent from this schema
+            // and makes every new Proxy response fail to save.
+            st.execute("DROP TRIGGER IF EXISTS burp_fts_ai")
+            db.prepareStatement("INSERT OR IGNORE INTO capture_metadata(key,value) VALUES('database_id',?)").use { insert ->
+                insert.setString(1, UUID.randomUUID().toString())
+                insert.executeUpdate()
+            }
         }
+        initializeInventory(db)
+        initializePacketChanges(db)
     }
 }
 
 private fun ResultSet.intOrNull(column: String): Int? = getInt(column).let { if (wasNull()) null else it }
+private fun boundedMetadata(value: String): String =
+    if (value.length > METADATA_TEXT_LIMIT) value.take(METADATA_TEXT_LIMIT) + "…" else value
 private fun ResultSet.summary() = PacketSummary(
     getLong("id"), getString("host"), getString("method"), getString("url"), intOrNull("status_code"),
     getInt("request_size"), intOrNull("response_size"), getInt("is_sent_from_mcp") != 0,
@@ -800,6 +1241,11 @@ private fun harHeaders(head: ByteArray) = buildJsonArray {
 private fun harMimeType(head: ByteArray): String = harHeaderLines(head)
     .firstOrNull { it.startsWith("Content-Type:", ignoreCase = true) }
     ?.substringAfter(':')?.trim()?.substringBefore(';') ?: "application/octet-stream"
+
+private fun responseMimeType(head: ByteArray?): String? = head?.let { bytes ->
+    harHeaderLines(bytes).firstOrNull { it.startsWith("Content-Type:", ignoreCase = true) }
+        ?.substringAfter(':')?.trim()?.substringBefore(';')?.takeIf(String::isNotBlank)
+}
 
 private fun harStatusText(head: ByteArray): String = String(head, StandardCharsets.ISO_8859_1)
     .lineSequence().firstOrNull()?.trimEnd('\r')?.split(' ', limit = 3)?.getOrNull(2) ?: ""

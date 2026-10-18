@@ -42,8 +42,9 @@ fun Server.registerPacketTools(packets: PacketRepository, storage: ProjectStorag
     }
     mcpTool<StartPacketCapture>(
         "Open or create packets.sqlite3 in the configured storage.db_dir, or in projectPath if no config is loaded. " +
-            "Rescan the entire current Burp proxy history, " +
-            "then keep collecting new traffic. Exact duplicate packets and identical request/response bodies are stored once."
+            "Begin a background scan of the entire Burp proxy history, then collect new responses through Burp events. " +
+            "Use get_db_info for historyScanPhase, historyScanProcessed, historyScanTotal and capture error counters. " +
+            "Exact duplicate packets and identical request/response bodies are stored once."
     ) {
         val configured = storage.current()?.databaseDirectory
         val requested = projectPath?.let { Path.of(it).toRealPath() }
@@ -51,7 +52,7 @@ fun Server.registerPacketTools(packets: PacketRepository, storage: ProjectStorag
             "projectPath differs from storage.db_dir in config.yaml"
         }
         Json.encodeToString(packets.start((configured ?: requested
-            ?: error("Load config.yaml or provide projectPath")).toString()))
+            ?: error("Load config.yaml or provide projectPath")).toString(), backgroundScan = true))
     }
 
     mcpTool<StopPacketCapture>(
@@ -61,7 +62,7 @@ fun Server.registerPacketTools(packets: PacketRepository, storage: ProjectStorag
     mcpTool("get_db_info", "Return the connected packet database path, collection state, and table columns.") {
         Json.encodeToString(packets.info())
     }
-    mcpTool("get_db_schema", "Return CREATE TABLE statements for burp_packets, packet_blobs, and packet_body_fts, including how body hashes and external files relate.") {
+    mcpTool("get_db_schema", "Return CREATE TABLE statements for packets, blobs, full-text search, and the incrementally maintained API inventory, including body storage details.") {
         Json.encodeToString(packets.schema())
     }
     mcpTool("get_packet_count", "Return the number of unique saved HTTP packets.") {
@@ -70,6 +71,20 @@ fun Server.registerPacketTools(packets: PacketRepository, storage: ProjectStorag
     mcpTool("get_all_hosts_by_db", "List distinct hosts observed in the connected packet database.") {
         Json.encodeToString(packets.hosts())
     }
+    mcpTool<GetPacketDelta>(
+        "Return saved packet metadata. For lossless filtered incremental reads, pass afterChangeSeq=0 initially " +
+            "and then the returned lastChangeSeq on each call; this includes packets later promoted from MCP-sent " +
+            "to Proxy-observed. afterId/lastId remain for legacy insertion-only readers. " +
+            "Pass databaseId as expectedDatabaseId to detect a replaced DB. " +
+            "Optional exact host and excludeMcpSent filters; use get_packet for bodies."
+    ) { Json.encodeToString(packets.packetDelta(afterId, limit, host, excludeMcpSent, expectedDatabaseId, afterChangeSeq)) }
+    mcpTool<GetApiInventory>(
+        "Return a paged inventory of exact observed METHOD + path routes for one host. " +
+            "Includes counts, status codes, body/query flags, sample MIME and URL, and source packet IDs. " +
+            "Pass nextCursor unchanged for the next page; the cursor fixes route discovery to a DB packet ID and its filters. " +
+            "Counts and status summaries for already discovered routes reflect the latest saved packets. " +
+            "Paths are not guessed or merged into templates."
+    ) { Json.encodeToString(packets.apiInventory(host, limit, cursor, excludeMcpSent)) }
 
     mcpTool<SearchPacket>(
         "Search saved request and response bodies with SQLite FTS5. Returns packet metadata and short snippets; " +
@@ -122,6 +137,20 @@ fun Server.registerPacketTools(packets: PacketRepository, storage: ProjectStorag
 )
 @Serializable data class StartPacketCapture(val projectPath: String? = null)
 @Serializable data class StopPacketCapture(val closeDatabase: Boolean = false)
+@Serializable data class GetPacketDelta(
+    val afterId: Long = 0,
+    val afterChangeSeq: Long? = null,
+    val limit: Int = 100,
+    val host: String? = null,
+    val excludeMcpSent: Boolean = false,
+    val expectedDatabaseId: String? = null,
+)
+@Serializable data class GetApiInventory(
+    val host: String,
+    val limit: Int = 100,
+    val cursor: String? = null,
+    val excludeMcpSent: Boolean = false,
+)
 @Serializable data class SearchPacket(
     val targets: List<String>,
     val ftsSearchQuery: String,

@@ -96,7 +96,7 @@ class McpServerIntegrationTest {
             val toolNames = tools.map { it.name }
             assertTrue(toolNames.contains("output_project_options"), "Server should have output_project_options tool")
             assertTrue(toolNames.contains("output_user_options"), "Server should have output_user_options tool")
-            assertTrue(toolNames.containsAll(listOf("start_packet_capture", "search_packet", "get_packet", "save_packets", "get_db_info", "get_db_schema", "export_packets_har")))
+            assertTrue(toolNames.containsAll(listOf("start_packet_capture", "search_packet", "get_packet", "save_packets", "get_db_info", "get_db_schema", "export_packets_har", "get_packet_delta", "get_api_inventory")))
             assertTrue(toolNames.containsAll(listOf("load_project_config", "get_project_storage", "list_openapi_specs", "get_openapi_spec", "validate_openapi_spec")))
             assertFalse(toolNames.contains("put_openapi_spec"))
             assertTrue(client.listResourceUris().contains("burp-mcp://skills/openapi-from-packets"))
@@ -129,6 +129,18 @@ class McpServerIntegrationTest {
         val status = Json.parseToJsonElement(payload).jsonObject
         assertEquals("0", status.getValue("packetCount").jsonPrimitive.content)
         assertTrue(Files.exists(project.resolve("packets.sqlite3")))
+
+        val deltaResult = client.callTool("get_packet_delta", mapOf("afterId" to 0, "limit" to 10))
+        assertFalse(deltaResult?.isError ?: true)
+        val delta = Json.parseToJsonElement((deltaResult!!.content.single() as TextContent).text).jsonObject
+        assertTrue(delta.getValue("items").jsonArray.isEmpty())
+        assertEquals("0", delta.getValue("lastId").jsonPrimitive.content)
+        assertTrue(delta.getValue("databaseId").jsonPrimitive.content.isNotBlank())
+
+        val inventoryResult = client.callTool("get_api_inventory", mapOf("host" to "cafe.naver.com"))
+        assertFalse(inventoryResult?.isError ?: true)
+        val inventory = Json.parseToJsonElement((inventoryResult!!.content.single() as TextContent).text).jsonObject
+        assertTrue(inventory.getValue("routes").jsonArray.isEmpty())
 
         val schemaResult = client.callTool("get_db_schema", emptyMap())
         assertFalse(schemaResult?.isError ?: true)

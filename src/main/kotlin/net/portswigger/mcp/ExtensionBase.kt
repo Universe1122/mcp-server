@@ -10,6 +10,7 @@ import net.portswigger.mcp.providers.ClaudeDesktopProvider
 import net.portswigger.mcp.providers.ManualProxyInstallerProvider
 import net.portswigger.mcp.providers.ProxyJarManager
 import net.portswigger.mcp.openapi.OpenApiViewer
+import net.portswigger.mcp.packet.ApiInventoryViewer
 import net.portswigger.mcp.tools.registerRepeaterCaptureContextMenu
 import net.portswigger.mcp.tools.registerRepeaterCaptureHotKeys
 import javax.swing.JTabbedPane
@@ -53,7 +54,9 @@ class ExtensionBase : BurpExtension {
             val request = HttpRequest.httpRequest(service, draft.rawRequest)
             api.repeater().sendToRepeater(request, draft.tabName)
         }
+        val inventoryViewer = ApiInventoryViewer(serverManager.packetRepository)
         val mcpTabs = JTabbedPane().apply {
+            addTab("Inventory", inventoryViewer)
             addTab("Swagger", openApiViewer)
             addTab("Settings", configUi.component)
             selectedIndex = 1
@@ -63,6 +66,7 @@ class ExtensionBase : BurpExtension {
         api.extension().registerUnloadingHandler {
             serverManager.shutdown()
             openApiViewer.close()
+            inventoryViewer.close()
             configUi.cleanup()
             config.cleanup()
         }

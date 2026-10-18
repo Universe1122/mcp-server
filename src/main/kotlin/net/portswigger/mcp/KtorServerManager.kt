@@ -29,6 +29,7 @@ class KtorServerManager(private val api: MontoyaApi) : ServerManager {
 
     private var server: EmbeddedServer<*, *>? = null
     private val packets = PacketRepository(api)
+    val packetRepository: PacketRepository get() = packets
     private val storage = ProjectStorageConfig()
     val openApiStore = OpenApiStore(
         { packets.projectDirectory() ?: storage.current()?.databaseDirectory },

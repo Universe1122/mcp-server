@@ -132,8 +132,39 @@ through packets. Field lengths and query execution time remain bounded. Requests
 MCP server's HTTP tools are also stored when a database is
 connected; search can exclude them with `excludeMcpSent=true`.
 
+For incremental ingestion, call `get_packet_delta` with `afterChangeSeq=0` and a page `limit`
+(1–500). Process the returned metadata, then persist `lastChangeSeq` and `databaseId` in the
+agent's project state. Pass `lastChangeSeq` as the next `afterChangeSeq` and `databaseId` as
+`expectedDatabaseId`. A changed database ID causes an explicit error so a stale cursor cannot
+silently skip a new database. The cursor advances past nonmatching packets when an exact `host`
+or `excludeMcpSent` filter has no more matches. Use `get_packet` only for representative bodies;
+the delta never returns body content.
+
+`get_api_inventory` returns a page of exact observed `METHOD + path` routes for one host, with
+unique packet counts, status codes, query/body presence, a representative response MIME and URL,
+and first/last source packet IDs. It removes query strings from route keys but does not guess path
+parameters or merge string segments. Pass `nextCursor` unchanged to read the next page. The cursor
+fixes which routes were discovered by a packet ID, plus the host and filter; counts and status
+summaries for those routes can grow as new packets are saved. Start again without a cursor to see
+newly captured routes. Routes appear in first-observed packet order. Long paths and URLs are shortened to 4096
+characters in MCP results, with truncation flags; use the source packet ID for the full value.
+The Burp **MCP → Inventory** tab shows the same inventory with a host selector and
+Previous/Next controls. Its selected route displays the representative URL and source packet IDs.
+The inventory is maintained when unique packets are saved. Existing databases are indexed once
+on first connection after upgrading; the viewer refreshes when the repository reports a change.
+`start_packet_capture` starts the Burp History scan in the background. `get_db_info` reports
+`historyScanPhase`, `historyScanProcessed`, `historyScanTotal`, `historyScanInserted`, queue overflows,
+save failures, catch-up scans, and the last capture error. New Proxy responses are saved through
+Burp response events. A bounded event queue triggers a History catch-up scan if it fills, and
+stopping capture reconciles History once more.
+
+This change cursor survives Burp restarts and includes a packet originally sent through MCP if it
+is later observed in Proxy. `afterId` and `lastId` remain for older insertion-only clients; they
+cannot report a later origin change behind the packet ID cursor.
+
 `get_db_schema` returns the actual SQLite `CREATE TABLE` statements for `burp_packets`,
-`packet_blobs`, and `packet_body_fts`. Packet heads are stored in `burp_packets`; body hashes join
+`packet_blobs`, `packet_body_fts`, `api_route_summary`, `api_route_status_codes`, and `packet_changes`.
+Packet heads are stored in `burp_packets`; body hashes join
 to `packet_blobs`. When `packet_blobs.file_path` is set, resolve it relative to the directory
 containing `packets.sqlite3`.
 
