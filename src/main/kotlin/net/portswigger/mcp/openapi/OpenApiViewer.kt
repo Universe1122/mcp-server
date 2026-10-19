@@ -9,7 +9,7 @@ import java.awt.Dimension
 import java.awt.Font
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
-import java.awt.GridLayout
+import java.awt.Insets
 import java.awt.KeyEventDispatcher
 import java.awt.KeyboardFocusManager
 import java.awt.Rectangle
@@ -364,15 +364,27 @@ class OpenApiViewer(
                 "Source packets · latest ${visibleIds.size} of ${packetIds.size}"
             } else "Source packets"
             content.add(sectionHeading(heading))
-            content.add(sectionBody(JPanel(GridLayout(0, 4, 8, 6)).apply {
+            content.add(sectionBody(JPanel(GridBagLayout()).apply {
                 background = paleBlue
-                visibleIds.forEach { id ->
+                visibleIds.forEachIndexed { index, id ->
                     add(JButton("DB #$id  ↗").apply {
+                        margin = Insets(2, 8, 2, 8)
                         toolTipText = "Inspect stored packet #$id"
                         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
                         addActionListener { openPacket(id) }
+                    }, GridBagConstraints().apply {
+                        gridx = index % 4
+                        gridy = index / 4
+                        anchor = GridBagConstraints.WEST
+                        insets = Insets(0, 0, 6, 8)
                     })
                 }
+                add(Box.createHorizontalGlue(), GridBagConstraints().apply {
+                    gridx = 4
+                    gridy = 0
+                    weightx = 1.0
+                    fill = GridBagConstraints.HORIZONTAL
+                })
             }))
         }
         val parameterInputs = linkedMapOf<String, JTextField>()
