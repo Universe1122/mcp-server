@@ -128,9 +128,12 @@ Use `get_db_info`, `get_db_schema`, `get_packet_count`, `get_all_hosts_by_db`, `
 stored data. `query_burp_database` accepts a single read-only `SELECT` and returns a page with
 `rows`, `hasMore`, and `nextOffset`. Set `maxRows` (1–500) and pass `nextOffset` as the next call's
 `offset` until `hasMore` is false. Use a stable `ORDER BY`, such as `ORDER BY id`, when paging
-through packets. Field lengths and query execution time remain bounded. Requests sent through this
-MCP server's HTTP tools are also stored when a database is
-connected; search can exclude them with `excludeMcpSent=true`.
+through packets. Field lengths and query execution time remain bounded. The MCP server does not
+expose direct HTTP send tools. To make agent-issued requests visible in Burp Proxy HTTP history,
+configure the agent's HTTP client to use a Burp Proxy listener (commonly `127.0.0.1:8080`; verify
+the active listener in Burp). `create_repeater_tab` and `create_repeater_tab_http2` prepare editable
+requests without sending them. `excludeMcpSent` remains available for packets saved by older
+extension versions.
 
 For incremental ingestion, call `get_packet_delta` with `afterChangeSeq=0` and a page `limit`
 (1–500). Process the returned metadata, then persist `lastChangeSeq` and `databaseId` in the
@@ -203,6 +206,12 @@ and request body. Editable example values in the Parameters section populate the
 the agent can supply observed values with OpenAPI `example`, and the viewer uses temporary sample
 values where the spec has none. Review these values before sending. Creating the tab does not
 transmit the request. The Swing viewer works without a browser engine.
+
+Put representative packet database IDs on each OpenAPI operation as
+`x-burp-packet-ids: [203, 114]`. These are IDs from `get_packet` or `get_api_inventory`, not
+Proxy HTTP history row numbers. Include at most 20 distinct valid IDs, newest first, while
+covering different response codes or message shapes. The viewer sorts IDs by descending database
+ID and displays no more than 20 buttons, even when an older spec contains more references.
 
 For example, the project can contain:
 

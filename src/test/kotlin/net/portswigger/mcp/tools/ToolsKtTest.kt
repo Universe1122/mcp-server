@@ -5,8 +5,6 @@ import burp.api.montoya.burpsuite.TaskExecutionEngine
 import burp.api.montoya.collaborator.*
 import burp.api.montoya.core.BurpSuiteEdition
 import burp.api.montoya.core.ByteArray
-import burp.api.montoya.http.Http
-import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpProtocol
 import burp.api.montoya.http.message.HttpHeader
 import burp.api.montoya.http.message.requests.HttpRequest
@@ -52,7 +50,6 @@ class ToolsKtTest {
     private var serverStarted = false
     private val config: McpConfig
     private val mockHeaders = mutableListOf<HttpHeader>()
-    private val capturedRequest = slot<HttpRequest>()
 
     init {
         val persistedObject = mockk<PersistedObject>().apply {
@@ -164,44 +161,6 @@ class ToolsKtTest {
     @Nested
     inner class HttpToolsTests {
         @Test
-        fun `http1 line endings should be normalized`() {
-            val httpService = mockk<Http>()
-            val requestResponse = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
-            val httpResponse = mockk<HttpResponse>()
-            val contentSlot = slot<String>()
-            val rawResponse = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nResponse body"
-
-            every { HttpRequest.httpRequest(any(), capture(contentSlot)) } answers {
-                val content = secondArg<String>()
-                mockk<HttpRequest>().also {
-                    every { it.toString() } returns content
-                }
-            }
-            every { api.http() } returns httpService
-            every { requestResponse.response() } returns httpResponse
-            every { httpResponse.toString() } returns rawResponse
-            every { httpService.sendRequest(capture(capturedRequest)) } returns requestResponse
-
-            runBlocking {
-                val result = client.callTool(
-                    "send_http1_request", mapOf(
-                        "content" to "GET /foo HTTP/1.1\nHost: example.com\n\n",
-                        "targetHostname" to "example.com",
-                        "targetPort" to 80,
-                        "usesHttps" to false
-                    )
-                )
-
-                delay(100)
-                val text = result.expectTextContent()
-                assertEquals(rawResponse, text)
-            }
-
-            verify(exactly = 1) { httpService.sendRequest(any<HttpRequest>()) }
-            assertEquals("GET /foo HTTP/1.1\r\nHost: example.com\r\n\r\n", capturedRequest.captured.toString(), "Request body should match")
-        }
-
-        @Test
         fun `repeater line endings should be normalized to CRLF`() {
             val repeater = mockk<burp.api.montoya.repeater.Repeater>(relaxed = true)
             val contentSlot = slot<String>()
@@ -231,165 +190,6 @@ class ToolsKtTest {
             verify(exactly = 1) { repeater.sendToRepeater(request, "normalized") }
         }
 
-        @Test
-        fun `http1 request should handle no response`() {
-            val httpService = mockk<Http>()
-            val contentSlot = slot<String>()
-
-            every { HttpRequest.httpRequest(any(), capture(contentSlot)) } answers {
-                val content = secondArg<String>()
-                mockk<HttpRequest>().also {
-                    every { it.toString() } returns content
-                }
-            }
-            every { api.http() } returns httpService
-            every { httpService.sendRequest(any()) } returns null
-
-            runBlocking {
-                val result = client.callTool(
-                    "send_http1_request", mapOf(
-                        "content" to "GET /foo HTTP/1.1\r\nHost: example.com\r\n\r\n",
-                        "targetHostname" to "example.com",
-                        "targetPort" to 80,
-                        "usesHttps" to false
-                    )
-                )
-
-                delay(100)
-                result.expectTextContent("<no response>")
-            }
-        }
-
-        @Test
-        fun `http2 request should be formatted properly`() {
-            val httpService = mockk<Http>()
-            val httpResponse = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
-            val httpRequest = mockk<HttpRequest>()
-            val requestSlot = slot<HttpRequest>()
-            val headersSlot = slot<List<HttpHeader>>()
-            val bodySlot = slot<String>()
-
-            every { HttpRequest.http2Request(any(), capture(headersSlot), capture(bodySlot)) } returns httpRequest
-            every { httpResponse.toString() } returns "HTTP/2 200 OK\r\nContent-Type: text/plain\r\n\r\nResponse body"
-            every { api.http() } returns httpService
-            every { httpService.sendRequest(capture(requestSlot), HttpMode.HTTP_2) } returns httpResponse
-
-            val pseudoHeaders = mapOf(
-                "authority" to "example.com", "scheme" to "https", "method" to "GET", ":path" to "/test"
-            )
-            val headers = mapOf(
-                "User-Agent" to "Test Agent", "Accept" to "*/*"
-            )
-            val requestBody = "Test body"
-
-            runBlocking {
-                val result = client.callTool(
-                    "send_http2_request", mapOf(
-                        "pseudoHeaders" to Json.encodeToJsonElement(pseudoHeaders),
-                        "headers" to Json.encodeToJsonElement(headers),
-                        "requestBody" to requestBody,
-                        "targetHostname" to "example.com",
-                        "targetPort" to 443,
-                        "usesHttps" to true
-                    )
-                )
-
-                delay(100)
-                val text = result.expectTextContent()
-                assertFalse(text.contains("Error"), 
-                    "Expected success response but got error: $text")
-            }
-
-            verify(exactly = 1) { HttpRequest.http2Request(any(), any(), any<String>()) }
-            
-            assertEquals("Test body", bodySlot.captured, "Request body should match")
-            
-            val pseudoHeaderList = headersSlot.captured.filter { it.name().startsWith(":") }
-            val normalHeaderList = headersSlot.captured.filter { !it.name().startsWith(":") }
-            
-            assertTrue(pseudoHeaderList.any { it.name() == ":scheme" && it.value() == "https" })
-            assertTrue(pseudoHeaderList.any { it.name() == ":method" && it.value() == "GET" })
-            assertTrue(pseudoHeaderList.any { it.name() == ":path" && it.value() == "/test" })
-            assertTrue(pseudoHeaderList.any { it.name() == ":authority" && it.value() == "example.com" })
-            
-            assertTrue(normalHeaderList.any { it.name() == "user-agent" && it.value() == "Test Agent" })
-            assertTrue(normalHeaderList.any { it.name() == "accept" && it.value() == "*/*" })
-        }
-        
-        @Test
-        fun `http2 request should handle null response`() {
-            val httpService = mockk<Http>()
-            val httpRequest = mockk<HttpRequest>()
-
-            every { HttpRequest.http2Request(any(), any(), any<String>()) } returns httpRequest
-            every { api.http() } returns httpService
-            every { httpService.sendRequest(any(), HttpMode.HTTP_2) } returns null
-
-            val pseudoHeaders = mapOf("method" to "GET", "path" to "/test")
-            val headers = mapOf("User-Agent" to "Test Agent")
-
-            runBlocking {
-                val result = client.callTool(
-                    "send_http2_request", mapOf(
-                        "pseudoHeaders" to Json.encodeToJsonElement(pseudoHeaders),
-                        "headers" to Json.encodeToJsonElement(headers),
-                        "requestBody" to "",
-                        "targetHostname" to "example.com",
-                        "targetPort" to 443,
-                        "usesHttps" to true
-                    )
-                )
-
-                delay(100)
-                result.expectTextContent("<no response>")
-            }
-        }
-        
-        @Test
-        fun `http2 pseudo headers should be ordered correctly`() {
-            val httpService = mockk<Http>()
-            val httpResponse = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
-            val httpRequest = mockk<HttpRequest>()
-            val headersSlot = slot<List<HttpHeader>>()
-
-            every { HttpRequest.http2Request(any(), capture(headersSlot), any<String>()) } returns httpRequest
-            every { httpResponse.toString() } returns "HTTP/2 200 OK"
-            every { api.http() } returns httpService
-            every { httpService.sendRequest(any(), HttpMode.HTTP_2) } returns httpResponse
-
-            val pseudoHeaders = mapOf(
-                "path" to "/test",
-                ":authority" to "example.com", 
-                "method" to "GET",
-                "scheme" to "https"
-            )
-
-            runBlocking {
-                val result = client.callTool(
-                    "send_http2_request", mapOf(
-                        "pseudoHeaders" to Json.encodeToJsonElement(pseudoHeaders),
-                        "headers" to Json.encodeToJsonElement(emptyMap<String, String>()),
-                        "requestBody" to "",
-                        "targetHostname" to "example.com",
-                        "targetPort" to 443,
-                        "usesHttps" to true
-                    )
-                )
-                
-                delay(100)
-                assertNotNull(result)
-            }
-            
-            val pseudoHeaderNames = headersSlot.captured
-                .filter { it.name().startsWith(":") }
-                .map { it.name() }
-            
-            val expectedOrder = listOf(":scheme", ":method", ":path", ":authority")
-            for (i in 0 until minOf(expectedOrder.size, pseudoHeaderNames.size)) {
-                assertEquals(expectedOrder[i], pseudoHeaderNames[i], 
-                    "Pseudo headers should follow the order: scheme, method, path, authority")
-            }
-        }
     }
     
     @Test
@@ -1159,7 +959,7 @@ class ToolsKtTest {
 
     @Test
     fun `tool name conversion should work properly`() {
-        assertEquals("send_http1_request", "SendHttp1Request".toLowerSnakeCase())
+        assertEquals("create_repeater_tab", "CreateRepeaterTab".toLowerSnakeCase())
         assertEquals("test_case_conversion", "TestCaseConversion".toLowerSnakeCase())
         assertEquals("multiple_upper_case_letters", "MultipleUpperCaseLetters".toLowerSnakeCase())
     }

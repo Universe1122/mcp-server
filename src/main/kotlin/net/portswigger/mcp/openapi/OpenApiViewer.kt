@@ -1,5 +1,6 @@
 package net.portswigger.mcp.openapi
 
+import net.portswigger.mcp.packet.PacketDetail
 import java.awt.BorderLayout
 import java.awt.Color
 import java.awt.Component
@@ -8,7 +9,11 @@ import java.awt.Dimension
 import java.awt.Font
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
+import java.awt.GridLayout
+import java.awt.KeyEventDispatcher
+import java.awt.KeyboardFocusManager
 import java.awt.Rectangle
+import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.event.MouseWheelEvent
@@ -21,9 +26,11 @@ import javax.swing.JButton
 import javax.swing.JComboBox
 import javax.swing.JComponent
 import javax.swing.JLabel
+import javax.swing.MenuSelectionManager
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.Scrollable
+import javax.swing.JSplitPane
 import javax.swing.JTabbedPane
 import javax.swing.JTextArea
 import javax.swing.JTextField
@@ -32,15 +39,22 @@ import javax.swing.JToggleButton
 import javax.swing.KeyStroke
 import javax.swing.SwingConstants
 import javax.swing.SwingWorker
+import javax.swing.SwingUtilities
 import javax.swing.Timer
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 import javax.swing.tree.DefaultMutableTreeNode
 
+private const val MAX_VISIBLE_PACKET_IDS = 20
+
 /** Read-only, Burp-native OpenAPI explorer for the connected packet project. */
 class OpenApiViewer(
     private val store: OpenApiStore,
     private val createRepeaterTab: (RepeaterDraft) -> Unit,
+    private val loadPacket: (Long) -> PacketDetail?,
+    sendPacketToRepeater: (PacketDetail) -> Unit,
+    createPacketRequestEditor: (PacketDetail) -> Component,
+    createPacketResponseEditor: (PacketDetail) -> Component,
 ) : JPanel(BorderLayout()) {
     private val projectLabel = JLabel("Connect a packet project with start_packet_capture")
     private val hostSelector = JComboBox<String>()
@@ -62,10 +76,34 @@ class OpenApiViewer(
         override fun getScrollableTracksViewportHeight(): Boolean = false
     }
     private val viewerScroll = JScrollPane(page)
+    private val center = JPanel(BorderLayout())
+    private val packetPanel = PacketDetailPanel(
+        sendToRepeater = sendPacketToRepeater,
+        createRequestEditor = createPacketRequestEditor,
+        createResponseEditor = createPacketResponseEditor,
+        close = { closePacket() },
+    )
+    private var detailSplit: JSplitPane? = null
+    private var packetLoadGeneration = 0
+    private val packetEscapeDispatcher = KeyEventDispatcher { event ->
+        if (event.id != KeyEvent.KEY_PRESSED || event.keyCode != KeyEvent.VK_ESCAPE ||
+            detailSplit == null || !isShowing
+        ) {
+            false
+        } else {
+            val viewerWindow = SwingUtilities.getWindowAncestor(this)
+            if (viewerWindow?.isActive == true && MenuSelectionManager.defaultManager().selectedPath.isEmpty()) {
+                event.consume()
+                closePacket()
+                true
+            } else false
+        }
+    }
     private val busy = AtomicBoolean(false)
     private val expanded = mutableSetOf<String>()
     private var updatingHost = false
     private var document: OpenApiDocument? = null
+    private var shownProject: String? = null
     private var signature: String? = null
     private val timer = Timer(3000) { reload() }
     private data class Palette(
@@ -114,18 +152,20 @@ class OpenApiViewer(
         page.border = BorderFactory.createEmptyBorder(12, 14, 20, 14)
         page.add(heading, BorderLayout.NORTH)
         page.add(operationsPanel, BorderLayout.CENTER)
-        add(viewerScroll.apply {
+        viewerScroll.apply {
             border = BorderFactory.createEmptyBorder()
             viewport.background = pageColor
             horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
             verticalScrollBar.unitIncrement = 18
-        }, BorderLayout.CENTER)
+        }
+        center.add(viewerScroll, BorderLayout.CENTER)
+        add(center, BorderLayout.CENTER)
         whiteTheme.addActionListener { applyTheme() }
         darkTheme.addActionListener { applyTheme() }
         applyTheme()
 
         hostSelector.addActionListener {
-            if (!updatingHost) { signature = null; expanded.clear(); reload() }
+            if (!updatingHost) { closePacket(); signature = null; expanded.clear(); reload() }
         }
         search.document.addDocumentListener(object : DocumentListener {
             override fun insertUpdate(event: DocumentEvent) = renderOperations()
@@ -136,7 +176,10 @@ class OpenApiViewer(
         reload()
     }
 
-    fun close() { timer.stop() }
+    fun close() {
+        timer.stop()
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(packetEscapeDispatcher)
+    }
 
     private fun applyTheme() {
         page.background = pageColor
@@ -146,6 +189,7 @@ class OpenApiViewer(
         description.background = pageColor
         description.foreground = ink
         viewerScroll.viewport.background = pageColor
+        packetPanel.setDarkTheme(darkTheme.isSelected)
         renderOperations()
     }
 
@@ -171,6 +215,8 @@ class OpenApiViewer(
     }
 
     private fun showSnapshot(snapshot: Snapshot) {
+        if (shownProject != snapshot.project || document?.info?.host != snapshot.host) closePacket()
+        shownProject = snapshot.project
         projectLabel.text = snapshot.project?.let { "Project: $it" }
             ?: "Connect a packet project with start_packet_capture"
         val newSignature = listOf(snapshot.project, snapshot.host,
@@ -308,12 +354,30 @@ class OpenApiViewer(
             if (operation.description.isNotBlank()) appendLine(operation.description)
             operation.operationId?.let { appendLine("Operation ID: $it") }
             if (operation.tags.isNotEmpty()) appendLine("Tags: ${operation.tags.joinToString()}")
-            if (operation.packetIds.isNotEmpty()) appendLine("Burp packet IDs: ${operation.packetIds.joinToString()}")
         }.trim()
         if (overview.isNotBlank()) content.add(sectionBody(textPane(overview, 90)))
+        val packetIds = operation.packetIds.mapNotNull { it.toLongOrNull()?.takeIf { id -> id > 0 } }
+            .distinct().sortedDescending()
+        if (packetIds.isNotEmpty()) {
+            val visibleIds = packetIds.take(MAX_VISIBLE_PACKET_IDS)
+            val heading = if (packetIds.size > visibleIds.size) {
+                "Source packets · latest ${visibleIds.size} of ${packetIds.size}"
+            } else "Source packets"
+            content.add(sectionHeading(heading))
+            content.add(sectionBody(JPanel(GridLayout(0, 4, 8, 6)).apply {
+                background = paleBlue
+                visibleIds.forEach { id ->
+                    add(JButton("DB #$id  ↗").apply {
+                        toolTipText = "Inspect stored packet #$id"
+                        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                        addActionListener { openPacket(id) }
+                    })
+                }
+            }))
+        }
         val parameterInputs = linkedMapOf<String, JTextField>()
         val parameterPanel = parametersPanel(operation.parameters, parameterInputs)
-        val tryOut = JButton("Try it out → Repeater")
+        val tryOut = JButton("Send to Repeater")
         tryOut.toolTipText = "Create an editable request in Repeater without sending it"
         tryOut.addActionListener {
             runCatching {
@@ -599,6 +663,55 @@ class OpenApiViewer(
         background = paleBlue
         add(JLabel(message).apply { foreground = ink }, BorderLayout.NORTH)
         preferredSize = Dimension(500, 50)
+    }
+
+    private fun openPacket(id: Long) {
+        val generation = ++packetLoadGeneration
+        if (detailSplit == null) {
+            val scrollPosition = viewerScroll.verticalScrollBar.value
+            center.remove(viewerScroll)
+            val split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, viewerScroll, packetPanel).apply {
+                resizeWeight = 1.0
+                border = BorderFactory.createEmptyBorder()
+                dividerSize = 7
+            }
+            detailSplit = split
+            center.add(split, BorderLayout.CENTER)
+            KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(packetEscapeDispatcher)
+            center.revalidate()
+            SwingUtilities.invokeLater {
+                split.dividerLocation = (split.width - packetPanel.preferredSize.width).coerceAtLeast(350)
+                viewerScroll.verticalScrollBar.value = scrollPosition
+            }
+        }
+        packetPanel.showLoading(id)
+        object : SwingWorker<PacketDetail?, Unit>() {
+            override fun doInBackground(): PacketDetail? = loadPacket(id)
+            override fun done() {
+                if (generation != packetLoadGeneration || detailSplit == null) return
+                runCatching { get() }.onSuccess { packet ->
+                    if (packet == null) packetPanel.showError(id, "Packet #$id was not found in the connected database.")
+                    else packetPanel.showPacket(packet)
+                }.onFailure { error ->
+                    packetPanel.showError(id, error.cause?.message ?: error.message ?: "Could not load packet")
+                }
+            }
+        }.execute()
+    }
+
+    private fun closePacket() {
+        ++packetLoadGeneration
+        val split = detailSplit ?: return
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(packetEscapeDispatcher)
+        val scrollPosition = viewerScroll.verticalScrollBar.value
+        center.remove(split)
+        split.leftComponent = null
+        split.rightComponent = null
+        center.add(viewerScroll, BorderLayout.CENTER)
+        detailSplit = null
+        center.revalidate()
+        center.repaint()
+        SwingUtilities.invokeLater { viewerScroll.verticalScrollBar.value = scrollPosition }
     }
 
     private fun methodColor(method: String): Color = when (method) {

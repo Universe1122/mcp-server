@@ -144,7 +144,7 @@ class OpenApiStore(
         }
         val errors = mutableListOf<String>()
         val warnings = mutableListOf<String>()
-        if ((root["servers"] as? List<*>)?.isEmpty() != false) warnings += "No servers URL; Try it out will use the selected host"
+        if ((root["servers"] as? List<*>)?.isEmpty() != false) warnings += "No servers URL; Send to Repeater will use the selected host"
         var count = 0
         val paths = root["paths"] as Map<*, *>
         val placeholders = Regex("\\{([^{}]+)}")

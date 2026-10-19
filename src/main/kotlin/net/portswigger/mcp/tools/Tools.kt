@@ -5,7 +5,6 @@ import burp.api.montoya.burpsuite.TaskExecutionEngine.TaskExecutionEngineState.P
 import burp.api.montoya.burpsuite.TaskExecutionEngine.TaskExecutionEngineState.RUNNING
 import burp.api.montoya.collaborator.InteractionFilter
 import burp.api.montoya.core.BurpSuiteEdition
-import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpHeader
 import burp.api.montoya.http.message.requests.HttpRequest
@@ -22,7 +21,6 @@ import net.portswigger.mcp.schema.buildSiteMapTree
 import net.portswigger.mcp.schema.toSerializableForm
 import net.portswigger.mcp.security.HistoryAccessSecurity
 import net.portswigger.mcp.security.HistoryAccessType
-import net.portswigger.mcp.security.HttpRequestSecurity
 import java.awt.KeyboardFocusManager
 import java.util.Base64
 import java.util.regex.Pattern
@@ -95,63 +93,7 @@ private fun normalizePrelude(prelude: String): String = prelude
     .replace("\n", "\r\n")
 
 fun Server.registerTools(api: MontoyaApi, config: McpConfig, packets: PacketRepository) {
-
-    mcpTool<SendHttp1Request>("Issues an HTTP/1.1 request and returns the response.") {
-        val allowed = runBlocking {
-            HttpRequestSecurity.checkHttpRequestPermission(targetHostname, targetPort, config, content, api)
-        }
-        if (!allowed) {
-            api.logging().logToOutput("MCP HTTP request denied: $targetHostname:$targetPort")
-            return@mcpTool "Send HTTP request denied by Burp Suite"
-        }
-
-        api.logging().logToOutput("MCP HTTP/1.1 request: $targetHostname:$targetPort")
-
-        val fixedContent = normalizeHttpContent(content)
-
-        val request = HttpRequest.httpRequest(toMontoyaService(), fixedContent)
-        val requestResponse = api.http().sendRequest(request)
-        runCatching { packets.saveSent(request, requestResponse?.response()) }
-            .onFailure { api.logging().logToError("Failed to store MCP HTTP request: ${it.message}") }
-
-        requestResponse?.response()?.toString() ?: "<no response>"
-    }
-
-    mcpTool<SendHttp2Request>("Issues an HTTP/2 request and returns the response. Do NOT pass headers to the body parameter.") {
-        val http2RequestDisplay = buildString {
-            pseudoHeaders.forEach { (key, value) ->
-                val headerName = if (key.startsWith(":")) key else ":$key"
-                appendLine("$headerName: $value")
-            }
-            headers.forEach { (key, value) ->
-                appendLine("$key: $value")
-            }
-            if (requestBody.isNotBlank()) {
-                appendLine()
-                append(requestBody)
-            }
-        }
-
-        val allowed = runBlocking {
-            HttpRequestSecurity.checkHttpRequestPermission(targetHostname, targetPort, config, http2RequestDisplay, api)
-        }
-        if (!allowed) {
-            api.logging().logToOutput("MCP HTTP request denied: $targetHostname:$targetPort")
-            return@mcpTool "Send HTTP request denied by Burp Suite"
-        }
-
-        api.logging().logToOutput("MCP HTTP/2 request: $targetHostname:$targetPort")
-
-        val headerList = buildHttp2HeaderList(pseudoHeaders, headers)
-
-        val request = HttpRequest.http2Request(toMontoyaService(), headerList, requestBody)
-        val response = api.http().sendRequest(request, HttpMode.HTTP_2)
-        runCatching { packets.saveSent(request, response?.response()) }
-            .onFailure { api.logging().logToError("Failed to store MCP HTTP/2 request: ${it.message}") }
-
-        response?.toString() ?: "<no response>"
-    }
-
+    // Direct-send tools are intentionally not exposed: agent traffic should pass through Burp Proxy.
     mcpUnitTool<CreateRepeaterTab>("Creates an HTTP/1.1 Repeater tab with the specified raw HTTP request and optional tab name. Prefer create_repeater_tab_http2 for HTTP/2 targets.") {
         val request = HttpRequest.httpRequest(toMontoyaService(), normalizeHttpContent(content))
         api.repeater().sendToRepeater(request, tabName)
@@ -472,24 +414,6 @@ interface HttpServiceParams {
 
     fun toMontoyaService(): HttpService = HttpService.httpService(targetHostname, targetPort, usesHttps)
 }
-
-@Serializable
-data class SendHttp1Request(
-    val content: String,
-    override val targetHostname: String,
-    override val targetPort: Int,
-    override val usesHttps: Boolean
-) : HttpServiceParams
-
-@Serializable
-data class SendHttp2Request(
-    val pseudoHeaders: Map<String, String>,
-    val headers: Map<String, String>,
-    val requestBody: String,
-    override val targetHostname: String,
-    override val targetPort: Int,
-    override val usesHttps: Boolean
-) : HttpServiceParams
 
 @Serializable
 data class CreateRepeaterTab(

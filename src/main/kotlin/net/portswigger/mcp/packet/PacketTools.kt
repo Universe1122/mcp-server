@@ -80,7 +80,8 @@ fun Server.registerPacketTools(packets: PacketRepository, storage: ProjectStorag
     ) { Json.encodeToString(packets.packetDelta(afterId, limit, host, excludeMcpSent, expectedDatabaseId, afterChangeSeq)) }
     mcpTool<GetApiInventory>(
         "Return a paged inventory of exact observed METHOD + path routes for one host. " +
-            "Includes counts, status codes, body/query flags, sample MIME and URL, and source packet IDs. " +
+            "Includes counts, status codes, body/query flags, sample MIME and URL, and source packet database IDs. " +
+            "When writing OpenAPI, put at most 20 representative database IDs in each operation's x-burp-packet-ids, newest ID first. " +
             "Pass nextCursor unchanged for the next page; the cursor fixes route discovery to a DB packet ID and its filters. " +
             "Counts and status summaries for already discovered routes reflect the latest saved packets. " +
             "Paths are not guessed or merged into templates."
