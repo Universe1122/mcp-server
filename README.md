@@ -196,22 +196,41 @@ The extension does not infer OpenAPI from traffic. The agent reads saved packets
 spec, writes OpenAPI 3.x YAML, and saves `<host>.yaml` directly in the folder selected by
 `storage.openapi_dir` in the project's `config.yaml`. The Burp **MCP → Swagger** tab lists those files by
 host, shows a read-only Swagger-style API explorer, and reloads changed files. Click anywhere on an
-operation row to expand its description, source packet IDs, parameters, request body, response
+operation row to expand its description, source Burp History IDs, parameters, request body, response
 examples, and schemas. The viewer has White and Dark themes, and the expanded detail scrolls with
 the main page even when the pointer is over a parameter or response example. Search filters paths,
-methods, summaries, tags, and operation IDs. Schema
-trees resolve local `#/components/schemas/` references with a recursion limit. **Try it out →
-Repeater** creates an editable request tab from the documented server, path, required parameters,
-and request body. Editable example values in the Parameters section populate the Repeater draft;
-the agent can supply observed values with OpenAPI `example`, and the viewer uses temporary sample
-values where the spec has none. Review these values before sending. Creating the tab does not
+methods, summaries, descriptions, parameters, related schema fields, inspection badges, and operation IDs.
+Enable **Include packets** to search the selected host's saved URLs, request/response headers, and indexed
+text bodies. Matching packets are grouped under documented endpoints with short excerpts and links to the
+stored packet detail; use **Load more packet matches** to page through older results. Body search covers
+the indexed text prefix, while binary bodies are not searchable. Schema
+trees resolve local `#/components/schemas/` references with a recursion limit. **Send to Repeater**
+creates an editable request tab from the documented server, path, required parameters,
+and request body. Observed OpenAPI `example` values populate the Repeater draft. When no observed
+parameter or request-body value is documented, the viewer leaves the field or body blank. For a
+response without a documented example, the viewer shows a bounded actual response from a matching
+History reference when available. Review values before sending. Creating the tab does not
 transmit the request. The Swing viewer works without a browser engine.
 
-Put representative packet database IDs on each OpenAPI operation as
-`x-burp-packet-ids: [203, 114]`. These are IDs from `get_packet` or `get_api_inventory`, not
-Proxy HTTP history row numbers. Include at most 20 distinct valid IDs, newest first, while
-covering different response codes or message shapes. The viewer sorts IDs by descending database
-ID and displays no more than 20 buttons, even when an older spec contains more references.
+An endpoint can carry a `VULN` or `SAFE` inspection badge next to its path. Right-click its row
+to set or clear the badge. Agents use `list_endpoint_tags` and `set_endpoint_tag` for the same
+records. These records are kept in the connected packet database by host, method, and exact
+OpenAPI path, so rewriting the YAML does not erase them. Untagged means unreviewed; `VULN`
+denotes a confirmed finding, while `SAFE` means no issue was identified during the review.
+
+Put representative Burp Proxy HTTP History references on each OpenAPI operation as
+`x-burp-history-refs: [{historyId: 203, packetId: 278}]`. Resolve pairs through
+`packet_history_refs`. The viewer labels buttons with History numbers; the packet ID disambiguates
+History numbers reused after a Burp project restart. Include at most 20 verified pairs, newest
+saved packets first, while covering different response codes or message shapes. The viewer displays
+no more than 20 History buttons and opens the corresponding stored request and response. The bundled OpenAPI
+methodology also directs agents to exclude static resources, write descriptions in Korean, leave
+unknown purposes blank, and use observed non-sensitive values for examples.
+
+The **MCP → Settings** tab contains a `config.yaml` text editor. Select and load an existing file,
+edit it, then save. The editor validates YAML and storage paths, rejects external changes made
+after loading, and writes via a temporary file. Reload project config and restart packet capture
+to apply changed storage paths.
 
 For example, the project can contain:
 

@@ -121,7 +121,7 @@ internal class PacketDetailPanel(
     fun showLoading(id: Long?) {
         packet = null
         requestedId = id
-        idLabel.text = id?.let { "DATABASE PACKET #$it" } ?: "PACKET"
+        idLabel.text = id?.let { "BURP HISTORY #$it" } ?: "PACKET"
         heading.text = if (id == null) "Select a packet" else "Loading packet…"
         url.text = ""
         meta.text = if (id == null) "Click a packet ID in an endpoint to inspect its stored request and response."
@@ -147,7 +147,8 @@ internal class PacketDetailPanel(
 
     private fun render(value: PacketDetail) {
         val selectedTab = messageTabs.selectedIndex
-        idLabel.text = "DATABASE PACKET #${value.id}"
+        idLabel.text = value.burpHistoryId?.let { "BURP HISTORY #$it · DB #${value.id}" }
+            ?: "DATABASE PACKET #${value.id}"
         heading.text = "${value.method}  ${value.statusCode ?: "No response"}"
         url.text = value.url
         meta.text = "${value.host}:${value.port}  ·  ${if (value.usesHttps) "HTTPS" else "HTTP"}  ·  " +

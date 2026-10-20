@@ -21,6 +21,7 @@ class OpenApiStoreTest {
         assertTrue(store.load("cafe.naver.com").operations.single().details.contains("Responses"))
         assertEquals("https://cafe.naver.com", store.load("cafe.naver.com").servers.single())
         val operation = store.load("cafe.naver.com").operations.single()
+        assertEquals(listOf(OpenApiHistoryRef(42, 100), OpenApiHistoryRef(17, 101)), operation.historyRefs)
         assertEquals("id", operation.parameters.single()["name"])
         assertEquals("string", (operation.parameters.single()["schema"] as Map<*, *>)["type"])
         assertEquals("200", operation.responses.keys.single().toString())
@@ -70,6 +71,27 @@ class OpenApiStoreTest {
         assertFalse(report.valid)
         assertTrue(report.errors.any { "responses" in it })
         assertTrue(report.errors.any { "itemId" in it })
+    }
+
+    @Test
+    fun `validation rejects ambiguous bare history references`(@TempDir project: Path) {
+        val directory = Files.createDirectories(project.resolve("raw/resources/mcp-server/openapi"))
+        Files.writeString(directory.resolve("example.com.yaml"), """
+            openapi: 3.0.3
+            info:
+              title: Test
+              version: '1'
+            paths:
+              /items:
+                get:
+                  x-burp-history-ids: [10]
+                  responses:
+                    '200':
+                      description: OK
+        """.trimIndent())
+        val report = OpenApiStore({ project }).validate("example.com")
+        assertFalse(report.valid)
+        assertTrue(report.errors.any { "x-burp-history-refs" in it })
     }
 
     @Test
@@ -134,6 +156,11 @@ class OpenApiStoreTest {
                       type: integer
                 get:
                   summary: Synthetic test operation
+                  x-burp-history-refs:
+                    - historyId: 42
+                      packetId: 100
+                    - historyId: 17
+                      packetId: 101
                   parameters:
                     - name: id
                       in: path

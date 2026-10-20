@@ -1,6 +1,12 @@
 package net.portswigger.mcp.openapi
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import net.portswigger.mcp.packet.PacketDetail
+import net.portswigger.mcp.packet.PacketRepository
+import net.portswigger.mcp.packet.EndpointInspectionTag
+import net.portswigger.mcp.packet.SwaggerPacketSearchHit
+import net.portswigger.mcp.packet.SwaggerPacketSearchPage
 import java.awt.BorderLayout
 import java.awt.Color
 import java.awt.Component
@@ -24,8 +30,11 @@ import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JButton
 import javax.swing.JComboBox
+import javax.swing.JCheckBox
 import javax.swing.JComponent
 import javax.swing.JLabel
+import javax.swing.JMenuItem
+import javax.swing.JPopupMenu
 import javax.swing.MenuSelectionManager
 import javax.swing.JPanel
 import javax.swing.JScrollPane
@@ -50,8 +59,9 @@ private const val MAX_VISIBLE_PACKET_IDS = 20
 /** Read-only, Burp-native OpenAPI explorer for the connected packet project. */
 class OpenApiViewer(
     private val store: OpenApiStore,
+    private val tagStore: PacketRepository,
     private val createRepeaterTab: (RepeaterDraft) -> Unit,
-    private val loadPacket: (Long) -> PacketDetail?,
+    private val loadPacket: (Int, Long) -> PacketDetail?,
     sendPacketToRepeater: (PacketDetail) -> Unit,
     createPacketRequestEditor: (PacketDetail) -> Component,
     createPacketResponseEditor: (PacketDetail) -> Component,
@@ -59,6 +69,8 @@ class OpenApiViewer(
     private val projectLabel = JLabel("Connect a packet project with start_packet_capture")
     private val hostSelector = JComboBox<String>()
     private val search = JTextField(24)
+    private val includePackets = JCheckBox("Include packets")
+    private val searchStatus = JLabel()
     private val whiteTheme = JToggleButton("White", true)
     private val darkTheme = JToggleButton("Dark")
     private val themeGroup = ButtonGroup().apply { add(whiteTheme); add(darkTheme) }
@@ -100,11 +112,20 @@ class OpenApiViewer(
         }
     }
     private val busy = AtomicBoolean(false)
+    private var reloadPending = false
     private val expanded = mutableSetOf<String>()
     private var updatingHost = false
     private var document: OpenApiDocument? = null
+    private var inspectionTags: Map<String, EndpointInspectionTag> = emptyMap()
     private var shownProject: String? = null
     private var signature: String? = null
+    private val packetSearchDebounce = Timer(350) { loadPacketSearchPage() }.apply { isRepeats = false }
+    private var packetSearchGeneration = 0L
+    private var packetSearchBusy = false
+    private var packetSearchError: String? = null
+    private var packetMatches = emptyList<Pair<String, SwaggerPacketSearchHit>>()
+    private var packetNextBeforeId: Long? = Long.MAX_VALUE
+    private var packetHasMore = false
     private val timer = Timer(3000) { reload() }
     private data class Palette(
         val page: Color, val detail: Color, val ink: Color, val rule: Color,
@@ -129,10 +150,12 @@ class OpenApiViewer(
             add(hostSelector)
             add(JLabel("Search:"))
             add(search)
+            add(includePackets)
+            add(searchStatus)
             add(JLabel("Theme:"))
             add(whiteTheme)
             add(darkTheme)
-            add(JButton("Reload").apply { addActionListener { signature = null; reload() } })
+            add(JButton("Reload").apply { addActionListener { signature = null; schedulePacketSearch(); reload() } })
         }, BorderLayout.CENTER)
         controls.add(status, BorderLayout.SOUTH)
         add(controls, BorderLayout.NORTH)
@@ -165,19 +188,22 @@ class OpenApiViewer(
         applyTheme()
 
         hostSelector.addActionListener {
-            if (!updatingHost) { closePacket(); signature = null; expanded.clear(); reload() }
+            if (!updatingHost) { closePacket(); signature = null; expanded.clear(); schedulePacketSearch(); reload() }
         }
         search.document.addDocumentListener(object : DocumentListener {
-            override fun insertUpdate(event: DocumentEvent) = renderOperations()
-            override fun removeUpdate(event: DocumentEvent) = renderOperations()
-            override fun changedUpdate(event: DocumentEvent) = renderOperations()
+            override fun insertUpdate(event: DocumentEvent) = schedulePacketSearch()
+            override fun removeUpdate(event: DocumentEvent) = schedulePacketSearch()
+            override fun changedUpdate(event: DocumentEvent) = schedulePacketSearch()
         })
+        includePackets.addActionListener { schedulePacketSearch() }
         timer.start()
         reload()
     }
 
     fun close() {
         timer.stop()
+        packetSearchDebounce.stop()
+        packetSearchGeneration++
         KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(packetEscapeDispatcher)
     }
 
@@ -194,7 +220,7 @@ class OpenApiViewer(
     }
 
     private fun reload() {
-        if (!busy.compareAndSet(false, true)) return
+        if (!busy.compareAndSet(false, true)) { reloadPending = true; return }
         val requestedHost = hostSelector.selectedItem as? String
         object : SwingWorker<Snapshot, Unit>() {
             override fun doInBackground(): Snapshot {
@@ -203,24 +229,37 @@ class OpenApiViewer(
                 val host = requestedHost?.takeIf { selected -> specs.any { it.host == selected } }
                     ?: specs.firstOrNull()?.host
                 val loaded = host?.let { runCatching { store.load(it) }.getOrNull() }
-                return Snapshot(project?.toString(), specs, host, loaded)
+                val tags = host?.let { runCatching { tagStore.endpointInspectionTags(it) }.getOrDefault(emptyList()) }
+                    ?: emptyList()
+                return Snapshot(project?.toString(), specs, host, loaded, tags, tagStore.inspectionTagRevision())
             }
 
             override fun done() {
                 try { showSnapshot(get()) }
                 catch (error: Exception) { status.text = "OpenAPI reload failed: ${error.cause?.message ?: error.message}" }
-                finally { busy.set(false) }
+                finally {
+                    busy.set(false)
+                    if (reloadPending) { reloadPending = false; reload() }
+                }
             }
         }.execute()
     }
 
     private fun showSnapshot(snapshot: Snapshot) {
+        val selectedHost = hostSelector.selectedItem as? String
+        if (selectedHost != null && selectedHost != snapshot.host && snapshot.specs.any { it.host == selectedHost }) {
+            reloadPending = true
+            return
+        }
+        val documentChanged = shownProject != snapshot.project || document?.info?.sha256 != snapshot.document?.info?.sha256 ||
+            document?.info?.host != snapshot.host
         if (shownProject != snapshot.project || document?.info?.host != snapshot.host) closePacket()
         shownProject = snapshot.project
         projectLabel.text = snapshot.project?.let { "Project: $it" }
             ?: "Connect a packet project with start_packet_capture"
         val newSignature = listOf(snapshot.project, snapshot.host,
-            snapshot.specs.joinToString { "${it.host}:${it.sha256}:${it.error}" }).joinToString("|")
+            snapshot.specs.joinToString { "${it.host}:${it.sha256}:${it.error}" },
+            snapshot.tagRevision).joinToString("|")
         if (signature == newSignature) return
         signature = newSignature
         updatingHost = true
@@ -229,6 +268,8 @@ class OpenApiViewer(
         hostSelector.selectedItem = snapshot.host
         updatingHost = false
         document = snapshot.document
+        inspectionTags = snapshot.tags.associateBy { "${it.method} ${it.path}" }
+        if (documentChanged) schedulePacketSearch()
         val selected = snapshot.specs.firstOrNull { it.host == snapshot.host }
         status.text = when {
             snapshot.project == null -> "No packet project connected"
@@ -248,26 +289,122 @@ class OpenApiViewer(
     private fun renderOperations() {
         operationsPanel.removeAll()
         val loaded = document
-        val term = search.text.trim().lowercase()
+        val term = search.text.trim()
+        val packetHits = if (includePackets.isSelected && term.length >= 3)
+            packetMatches.groupBy({ it.first }, { it.second }) else emptyMap()
         val matches = loaded?.operations?.filter { operation ->
-            term.isEmpty() || listOf(operation.method, operation.path, operation.summary,
-                operation.operationId.orEmpty(), operation.tags.joinToString()).any { term in it.lowercase() }
+            val key = "${operation.method} ${operation.path}"
+            matchesOpenApiSearch(operation, inspectionTags[key]?.tag, term, loaded.schemas) || packetHits[key]?.isNotEmpty() == true
         } ?: emptyList()
         if (matches.isEmpty()) {
-            operationsPanel.add(JLabel(if (loaded == null) "No OpenAPI document loaded." else "No matching operations.").apply {
+            val message = when {
+                loaded == null -> "No OpenAPI document loaded."
+                packetSearchBusy -> "Searching saved packets…"
+                else -> "No matching operations."
+            }
+            operationsPanel.add(JLabel(message).apply {
                 foreground = ink
             })
         } else {
             matches.forEach { operation ->
-                operationsPanel.add(operationCard(operation, loaded!!))
+                operationsPanel.add(operationCard(operation, loaded!!, packetHits["${operation.method} ${operation.path}"].orEmpty()))
                 operationsPanel.add(Box.createVerticalStrut(7))
             }
+        }
+        if (includePackets.isSelected && packetHasMore && term.length >= 3) {
+            operationsPanel.add(JButton("Load more packet matches").apply {
+                alignmentX = LEFT_ALIGNMENT
+                isEnabled = !packetSearchBusy
+                addActionListener { loadPacketSearchPage() }
+            })
+        }
+        searchStatus.text = when {
+            !includePackets.isSelected -> ""
+            term.length < 3 -> "3+ characters for packet search"
+            packetSearchBusy -> "Searching packets…"
+            packetSearchError != null -> "Packet search failed: $packetSearchError"
+            else -> "${packetMatches.size} matching packets loaded${if (packetHasMore) " · more available" else ""}"
         }
         operationsPanel.revalidate()
         operationsPanel.repaint()
     }
 
-    private fun operationCard(operation: OpenApiOperation, loaded: OpenApiDocument): JPanel {
+    private fun schedulePacketSearch() {
+        packetSearchDebounce.stop()
+        packetSearchGeneration++
+        packetSearchBusy = false
+        packetSearchError = null
+        packetMatches = emptyList()
+        packetNextBeforeId = Long.MAX_VALUE
+        packetHasMore = false
+        renderOperations()
+        if (includePackets.isSelected && search.text.trim().length >= 3 && document != null)
+            packetSearchDebounce.restart()
+    }
+
+    private fun loadPacketSearchPage() {
+        val loaded = document ?: return
+        val query = search.text.trim()
+        val beforeId = packetNextBeforeId ?: return
+        if (!includePackets.isSelected || query.length < 3 || packetSearchBusy) return
+        val generation = packetSearchGeneration
+        val host = loaded.info.host
+        packetSearchBusy = true
+        renderOperations()
+        object : SwingWorker<SwaggerPacketSearchPage, Unit>() {
+            override fun doInBackground(): SwaggerPacketSearchPage =
+                tagStore.searchSwaggerPackets(host, query, beforeId, 100)
+
+            override fun done() {
+                if (generation != packetSearchGeneration || document?.info?.host != host ||
+                    search.text.trim() != query || !includePackets.isSelected) return
+                packetSearchBusy = false
+                runCatching { get() }.onSuccess { result ->
+                    packetMatches = packetMatches + result.hits.mapNotNull { hit ->
+                        matchingOpenApiOperation(loaded.operations, hit.method, hit.url)?.let { operation ->
+                            "${operation.method} ${operation.path}" to hit
+                        }
+                    }
+                    packetHasMore = result.hasMore
+                    packetNextBeforeId = result.nextBeforeId
+                }.onFailure { error ->
+                    packetHasMore = false
+                    packetNextBeforeId = null
+                    packetSearchError = error.cause?.message ?: error.message ?: "Unknown error"
+                }
+                renderOperations()
+            }
+        }.execute()
+    }
+
+    private fun packetSearchPreview(hits: List<SwaggerPacketSearchHit>, operation: OpenApiOperation,
+                                    loaded: OpenApiDocument): JPanel = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        background = paleBlue
+        border = BorderFactory.createEmptyBorder(6, 16, 8, 16)
+        add(JLabel("Packet matches · ${hits.size} loaded").apply {
+            foreground = ink
+            font = font.deriveFont(Font.BOLD)
+            alignmentX = LEFT_ALIGNMENT
+        })
+        hits.take(3).forEach { hit ->
+            val reference = hit.historyId?.let { "History #$it" } ?: "DB #${hit.packetId}"
+            val excerpt = hit.snippet.replace(Regex("\\s+"), " ").take(140)
+            add(JButton("$reference · ${hit.location} · $excerpt").apply {
+                horizontalAlignment = SwingConstants.LEFT
+                alignmentX = LEFT_ALIGNMENT
+                toolTipText = "Open stored packet #${hit.packetId}"
+                addActionListener { openSearchPacket(hit, operation, loaded) }
+            })
+        }
+        if (hits.size > 3) add(JLabel("${hits.size - 3} more loaded matches").apply {
+            foreground = ink
+            alignmentX = LEFT_ALIGNMENT
+        })
+    }
+
+    private fun operationCard(operation: OpenApiOperation, loaded: OpenApiDocument,
+                              hits: List<SwaggerPacketSearchHit>): JPanel {
         val key = "${operation.method} ${operation.path}"
         val accent = methodColor(operation.method)
         val card = JPanel(BorderLayout())
@@ -285,9 +422,27 @@ class OpenApiViewer(
         header.add(method, BorderLayout.WEST)
         header.add(JPanel(BorderLayout(12, 0)).apply {
             isOpaque = false
-            add(JLabel(operation.path).apply {
-                font = font.deriveFont(Font.BOLD)
-                foreground = ink
+            add(JPanel(GridBagLayout()).apply {
+                isOpaque = false
+                add(JLabel(operation.path).apply {
+                    font = font.deriveFont(Font.BOLD)
+                    foreground = ink
+                }, GridBagConstraints().apply {
+                    gridx = 0
+                    anchor = GridBagConstraints.WEST
+                    insets = Insets(0, 0, 0, 8)
+                })
+                inspectionTags[key]?.let { saved ->
+                    add(inspectionBadge(saved.tag), GridBagConstraints().apply {
+                        gridx = 1
+                        anchor = GridBagConstraints.WEST
+                    })
+                }
+                add(Box.createHorizontalGlue(), GridBagConstraints().apply {
+                    gridx = 2
+                    weightx = 1.0
+                    fill = GridBagConstraints.HORIZONTAL
+                })
             }, BorderLayout.CENTER)
             add(JLabel(operation.summary.ifBlank { operation.tags.joinToString() }).apply {
                 foreground = ink
@@ -298,21 +453,23 @@ class OpenApiViewer(
             foreground = ink
         }
         header.add(chevron, BorderLayout.EAST)
+        val body = JPanel(BorderLayout()).apply { background = paleBlue }
+        if (hits.isNotEmpty()) body.add(packetSearchPreview(hits, operation, loaded), BorderLayout.NORTH)
         var detail: JPanel? = null
         if (key in expanded) {
             detail = operationDetails(operation, loaded)
             routeDetailWheel(detail)
-            card.add(detail, BorderLayout.CENTER)
+            body.add(detail, BorderLayout.CENTER)
         } else chevron.text = "▸"
         fun toggle() {
             if (detail == null) {
                 detail = operationDetails(operation, loaded)
                 routeDetailWheel(detail!!)
-                card.add(detail, BorderLayout.CENTER)
+                body.add(detail, BorderLayout.CENTER)
                 expanded.add(key)
                 chevron.text = "▾"
             } else {
-                card.remove(detail)
+                body.remove(detail)
                 detail = null
                 expanded.remove(key)
                 chevron.text = "▸"
@@ -321,8 +478,20 @@ class OpenApiViewer(
             card.revalidate()
             card.repaint()
         }
+        val popup = JPopupMenu().apply {
+            listOf("VULN" to "Mark VULN", "SAFE" to "Mark SAFE", null to "Clear tag").forEach { (tag, title) ->
+                add(JMenuItem(title).apply { addActionListener { updateInspectionTag(loaded.info.host, operation, tag) } })
+            }
+        }
         val click = object : MouseAdapter() {
-            override fun mouseClicked(event: MouseEvent) = toggle()
+            override fun mousePressed(event: MouseEvent) = showPopup(event)
+            override fun mouseReleased(event: MouseEvent) = showPopup(event)
+            override fun mouseClicked(event: MouseEvent) {
+                if (SwingUtilities.isLeftMouseButton(event)) toggle()
+            }
+            private fun showPopup(event: MouseEvent) {
+                if (event.isPopupTrigger) popup.show(event.component, event.x, event.y)
+            }
         }
         bindHeaderClick(header, click)
         header.isFocusable = true
@@ -332,6 +501,7 @@ class OpenApiViewer(
             override fun actionPerformed(event: java.awt.event.ActionEvent) = toggle()
         })
         card.add(header, BorderLayout.NORTH)
+        card.add(body, BorderLayout.CENTER)
         card.maximumSize = Dimension(Int.MAX_VALUE, card.preferredSize.height)
         return card
     }
@@ -339,6 +509,32 @@ class OpenApiViewer(
     private fun bindHeaderClick(component: Component, click: MouseAdapter) {
         component.addMouseListener(click)
         if (component is java.awt.Container) component.components.forEach { bindHeaderClick(it, click) }
+    }
+
+    private fun inspectionBadge(tag: String): JLabel = JLabel(tag).apply {
+        isOpaque = true
+        background = if (tag == "VULN") Color(174, 45, 55) else Color(36, 125, 75)
+        foreground = Color.WHITE
+        font = font.deriveFont(Font.BOLD, 10f)
+        border = BorderFactory.createEmptyBorder(3, 7, 3, 7)
+        toolTipText = if (tag == "VULN") "Confirmed vulnerability" else "Reviewed: no issue identified"
+    }
+
+    private fun updateInspectionTag(host: String, operation: OpenApiOperation, tag: String?) {
+        object : SwingWorker<Unit, Unit>() {
+            override fun doInBackground() {
+                tagStore.setEndpointInspectionTag(host, operation.method, operation.path, tag, "human")
+            }
+            override fun done() {
+                try {
+                    get()
+                    signature = null
+                    reload()
+                } catch (error: Exception) {
+                    status.text = "Could not save endpoint tag: ${error.cause?.message ?: error.message}"
+                }
+            }
+        }.execute()
     }
 
     private fun routeDetailWheel(component: Component) {
@@ -356,22 +552,22 @@ class OpenApiViewer(
             if (operation.tags.isNotEmpty()) appendLine("Tags: ${operation.tags.joinToString()}")
         }.trim()
         if (overview.isNotBlank()) content.add(sectionBody(textPane(overview, 90)))
-        val packetIds = operation.packetIds.mapNotNull { it.toLongOrNull()?.takeIf { id -> id > 0 } }
-            .distinct().sortedDescending()
-        if (packetIds.isNotEmpty()) {
-            val visibleIds = packetIds.take(MAX_VISIBLE_PACKET_IDS)
-            val heading = if (packetIds.size > visibleIds.size) {
-                "Source packets · latest ${visibleIds.size} of ${packetIds.size}"
+        val packetRefs = operation.historyRefs.distinct().sortedWith(
+            compareByDescending<OpenApiHistoryRef> { it.packetId }.thenByDescending { it.historyId })
+        if (packetRefs.isNotEmpty()) {
+            val visibleRefs = packetRefs.take(MAX_VISIBLE_PACKET_IDS)
+            val heading = if (packetRefs.size > visibleRefs.size) {
+                "Source packets · latest ${visibleRefs.size} of ${packetRefs.size}"
             } else "Source packets"
             content.add(sectionHeading(heading))
             content.add(sectionBody(JPanel(GridBagLayout()).apply {
                 background = paleBlue
-                visibleIds.forEachIndexed { index, id ->
-                    add(JButton("DB #$id  ↗").apply {
+                visibleRefs.forEachIndexed { index, ref ->
+                    add(JButton("History #${ref.historyId}  ↗").apply {
                         margin = Insets(2, 8, 2, 8)
-                        toolTipText = "Inspect stored packet #$id"
+                        toolTipText = "Inspect Burp History #${ref.historyId} (stored packet #${ref.packetId})"
                         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-                        addActionListener { openPacket(id) }
+                        addActionListener { openPacket(ref, operation, loaded) }
                     }, GridBagConstraints().apply {
                         gridx = index % 4
                         gridy = index / 4
@@ -405,10 +601,10 @@ class OpenApiViewer(
         content.add(sectionBody(parameterPanel))
         if (operation.requestBody != null) {
             content.add(sectionHeading("Request body"))
-            content.add(sectionBody(contentPanel(operation.requestBody, loaded)))
+            content.add(sectionBody(contentPanel(operation.requestBody, loaded, operation)))
         }
         content.add(sectionHeading("Responses"))
-        content.add(sectionBody(responsesPanel(operation.responses, loaded)))
+        content.add(sectionBody(responsesPanel(operation.responses, loaded, operation)))
         return content
     }
 
@@ -472,18 +668,18 @@ class OpenApiViewer(
         }
     }
 
-    private fun contentPanel(body: Map<*, *>?, loaded: OpenApiDocument): JPanel {
+    private fun contentPanel(body: Map<*, *>?, loaded: OpenApiDocument, operation: OpenApiOperation): JPanel {
         if (body == null) return messagePanel("No request body documented.")
         val panel = JPanel(BorderLayout(0, 6))
         panel.background = paleBlue
         val description = listOfNotNull(body["description"]?.toString(),
             if (body["required"] == true) "Required" else null).joinToString("  ·  ")
         if (description.isNotBlank()) panel.add(JLabel(description).apply { foreground = ink }, BorderLayout.NORTH)
-        panel.add(mediaTypesPanel(body["content"] as? Map<*, *>, loaded), BorderLayout.CENTER)
+        panel.add(mediaTypesPanel(body["content"] as? Map<*, *>, loaded, operation), BorderLayout.CENTER)
         return panel
     }
 
-    private fun responsesPanel(responses: Map<*, *>, loaded: OpenApiDocument): JPanel {
+    private fun responsesPanel(responses: Map<*, *>, loaded: OpenApiDocument, operation: OpenApiOperation): JPanel {
         if (responses.isEmpty()) return messagePanel("No responses documented.")
         val panel = JPanel()
         panel.layout = BoxLayout(panel, BoxLayout.Y_AXIS)
@@ -511,7 +707,7 @@ class OpenApiViewer(
                 foreground = ink
                 font = font.deriveFont(Font.BOLD)
             }, BorderLayout.NORTH)
-            description.add(mediaTypesPanel(response?.get("content") as? Map<*, *>, loaded), BorderLayout.CENTER)
+            description.add(mediaTypesPanel(response?.get("content") as? Map<*, *>, loaded, operation, code.toString()), BorderLayout.CENTER)
             row.add(description, BorderLayout.CENTER)
             row.add(JLabel(if (response?.get("links") is Map<*, *>) "Links" else "No links").apply {
                 foreground = ink
@@ -523,29 +719,51 @@ class OpenApiViewer(
         return panel
     }
 
-    private fun mediaTypesPanel(content: Map<*, *>?, loaded: OpenApiDocument): JPanel {
+    private fun mediaTypesPanel(content: Map<*, *>?, loaded: OpenApiDocument,
+                                operation: OpenApiOperation, responseCode: String? = null): JPanel {
         if (content.isNullOrEmpty()) return messagePanel("No content schema documented.")
         val panel = JPanel(BorderLayout(0, 7))
         panel.background = paleBlue
         val selector = JComboBox(content.keys.map { it.toString() }.toTypedArray())
         val schemaContainer = JPanel(BorderLayout())
         schemaContainer.background = paleBlue
+        var previewGeneration = 0
         fun showSchema() {
+            val generation = ++previewGeneration
             schemaContainer.removeAll()
             val media = content[selector.selectedItem] as? Map<*, *>
             val schema = media?.get("schema")
             val example = media?.get("example") ?: (media?.get("examples") as? Map<*, *>)
                 ?.values?.firstOrNull()?.let { (it as? Map<*, *>)?.get("value") }
-            val preview = if (example == null) OpenApiRequestBuilder.exampleJson(schema, loaded.schemas)
+            val preview = if (example == null) "No observed example is documented."
                 else OpenApiRequestBuilder.exampleJson(mapOf("example" to example), loaded.schemas)
             val tabs = JTabbedPane()
-            tabs.addTab(if (example == null) "Example Value (generated)" else "Example Value",
-                textPane(preview, 190, code = true))
+            val previewText = JTextArea(preview).apply {
+                isEditable = false
+                font = Font(Font.MONOSPACED, Font.PLAIN, 12)
+                background = palette.code
+                foreground = palette.codeInk
+                caretPosition = 0
+            }
+            tabs.addTab("Example Value", JScrollPane(previewText).apply { preferredSize = Dimension(500, 190) })
             tabs.addTab("Schema", schemaTree(schema, loaded.schemas))
             routeDetailWheel(tabs)
             schemaContainer.add(tabs, BorderLayout.CENTER)
             schemaContainer.revalidate()
             schemaContainer.repaint()
+            if (example == null && responseCode != null) {
+                val mime = selector.selectedItem.toString().substringBefore(';').trim().lowercase()
+                object : SwingWorker<String?, Unit>() {
+                    override fun doInBackground(): String? = observedResponseExample(loaded, operation, responseCode, mime)
+                    override fun done() {
+                        if (generation != previewGeneration) return
+                        runCatching { get() }.getOrNull()?.let {
+                            previewText.text = it
+                            previewText.caretPosition = 0
+                        }
+                    }
+                }.execute()
+            }
         }
         selector.addActionListener { showSchema() }
         panel.add(JPanel(BorderLayout()).apply {
@@ -556,6 +774,31 @@ class OpenApiViewer(
         panel.add(schemaContainer, BorderLayout.CENTER)
         showSchema()
         return panel
+    }
+
+    private fun observedResponseExample(loaded: OpenApiDocument, operation: OpenApiOperation,
+                                        responseCode: String, mime: String): String? {
+        if (!(mime.startsWith("text/") || mime.contains("json") || mime.contains("xml") ||
+                    mime == "application/x-www-form-urlencoded")) return null
+        for (ref in operation.historyRefs.sortedByDescending { it.packetId }.take(MAX_VISIBLE_PACKET_IDS)) {
+            val packet = loadPacket(ref.historyId, ref.packetId) ?: continue
+            if (!matchesOperation(loaded, operation, packet)) continue
+            if (packet.statusCode?.toString() != responseCode || packet.responseBodyTruncated) continue
+            val actualMime = packet.responseHeaders?.lineSequence()?.firstOrNull {
+                it.startsWith("Content-Type:", ignoreCase = true)
+            }?.substringAfter(':')?.trim()?.substringBefore(';')?.lowercase()
+            if (actualMime != null && actualMime != mime) continue
+            val bytes = packet.responseBodyBase64?.let { java.util.Base64.getDecoder().decode(it) } ?: continue
+            if (bytes.isEmpty()) continue
+            val text = bytes.toString(Charsets.UTF_8)
+            if ('\u0000' in text) continue
+            val formatted = if (mime.contains("json")) runCatching {
+                Json { prettyPrint = true }.encodeToString(JsonElement.serializer(), Json.parseToJsonElement(text))
+            }.getOrDefault(text) else text
+            val displayed = if (formatted.length > 32_000) formatted.take(32_000) + "\n… (preview truncated)" else formatted
+            return "Observed response · History #${ref.historyId}\n\n$displayed"
+        }
+        return null
     }
 
     private fun sectionHeading(label: String, action: JButton? = null): JPanel =
@@ -677,7 +920,31 @@ class OpenApiViewer(
         preferredSize = Dimension(500, 50)
     }
 
-    private fun openPacket(id: Long) {
+    private fun matchesOperation(loaded: OpenApiDocument, operation: OpenApiOperation,
+                                 packet: PacketDetail): Boolean {
+        if (!packet.host.equals(loaded.info.host, ignoreCase = true) ||
+            !packet.method.equals(operation.method, ignoreCase = true)) return false
+        val actualPath = runCatching { java.net.URI(packet.url).path }.getOrNull() ?: return false
+        val expected = operation.path.split('/')
+        val actual = actualPath.split('/')
+        return expected.size == actual.size && expected.zip(actual).all { (template, segment) ->
+            (template.startsWith('{') && template.endsWith('}') && segment.isNotEmpty()) || template == segment
+        }
+    }
+
+    private fun openPacket(ref: OpenApiHistoryRef, operation: OpenApiOperation, loaded: OpenApiDocument) {
+        openPacketDetail(ref.historyId.toLong(), operation, loaded) { loadPacket(ref.historyId, ref.packetId) }
+    }
+
+    private fun openSearchPacket(hit: SwaggerPacketSearchHit, operation: OpenApiOperation, loaded: OpenApiDocument) {
+        openPacketDetail(hit.historyId?.toLong() ?: hit.packetId, operation, loaded) {
+            if (hit.historyId != null) loadPacket(hit.historyId, hit.packetId)
+            else tagStore.getPacket(hit.packetId, 1_048_576)
+        }
+    }
+
+    private fun openPacketDetail(id: Long, operation: OpenApiOperation, loaded: OpenApiDocument,
+                                 fetch: () -> PacketDetail?) {
         val generation = ++packetLoadGeneration
         if (detailSplit == null) {
             val scrollPosition = viewerScroll.verticalScrollBar.value
@@ -698,11 +965,12 @@ class OpenApiViewer(
         }
         packetPanel.showLoading(id)
         object : SwingWorker<PacketDetail?, Unit>() {
-            override fun doInBackground(): PacketDetail? = loadPacket(id)
+            override fun doInBackground(): PacketDetail? = fetch()
             override fun done() {
                 if (generation != packetLoadGeneration || detailSplit == null) return
                 runCatching { get() }.onSuccess { packet ->
-                    if (packet == null) packetPanel.showError(id, "Packet #$id was not found in the connected database.")
+                    if (packet == null || !matchesOperation(loaded, operation, packet))
+                        packetPanel.showError(id, "Saved packet #$id does not match this endpoint in the connected database.")
                     else packetPanel.showPacket(packet)
                 }.onFailure { error ->
                     packetPanel.showError(id, error.cause?.message ?: error.message ?: "Could not load packet")
@@ -738,6 +1006,7 @@ class OpenApiViewer(
     private data class Snapshot(
         val project: String?, val specs: List<OpenApiSpecInfo>,
         val host: String?, val document: OpenApiDocument?,
+        val tags: List<EndpointInspectionTag>, val tagRevision: Long,
     )
 
 }

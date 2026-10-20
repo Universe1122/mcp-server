@@ -116,7 +116,7 @@ class KtorServerManager(private val api: MontoyaApi) : ServerManager {
 
                     mcpServer.registerTools(api, config, packets)
                     mcpServer.registerPacketTools(packets, storage, config, openApiStore)
-                    mcpServer.registerOpenApiTools(openApiStore)
+                    mcpServer.registerOpenApiTools(openApiStore, packetRepository)
                 }.apply {
                     start(wait = false)
                 }

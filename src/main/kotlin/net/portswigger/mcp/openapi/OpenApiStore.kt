@@ -57,9 +57,11 @@ data class OpenApiOperation(
     val parameters: List<Map<*, *>> = emptyList(),
     val requestBody: Map<*, *>? = null,
     val responses: Map<*, *> = emptyMap<Any, Any>(),
-    val packetIds: List<String> = emptyList(),
+    val historyRefs: List<OpenApiHistoryRef> = emptyList(),
     val servers: List<String> = emptyList(),
 )
+
+data class OpenApiHistoryRef(val historyId: Int, val packetId: Long)
 
 data class OpenApiDocument(
     val info: OpenApiSpecInfo,
@@ -163,6 +165,18 @@ class OpenApiStore(
                 if ((operation["responses"] as? Map<*, *>)?.isNotEmpty() != true) {
                     errors += "$label: responses must be a non-empty object"
                 }
+                if ("x-burp-packet-ids" in operation || "x-burp-history-ids" in operation) {
+                    errors += "$label: use x-burp-history-refs with historyId and packetId pairs"
+                }
+                if ("x-burp-history-refs" in operation) {
+                    val refs = operation["x-burp-history-refs"] as? List<*>
+                    if (refs == null || refs.any { raw ->
+                        val pair = raw as? Map<*, *> ?: return@any true
+                        (pair["historyId"]?.toString()?.toIntOrNull() ?: 0) <= 0 ||
+                            (pair["packetId"]?.toString()?.toLongOrNull() ?: 0) <= 0
+                    }) errors += "$label: x-burp-history-refs must contain positive historyId and packetId pairs"
+                    if (refs != null && refs.size > 20) warnings += "$label: only the latest 20 History references are displayed"
+                }
                 val parameters = operationParameters(root, pathItem, operation)
                 for (match in placeholders.findAll(path)) {
                     val name = match.groupValues[1]
@@ -216,7 +230,12 @@ class OpenApiStore(
                     operationParameters(root, pathItem, operation),
                     operation["requestBody"] as? Map<*, *>,
                     operation["responses"] as? Map<*, *> ?: emptyMap<Any, Any>(),
-                    (operation["x-burp-packet-ids"] as? List<*>)?.map { it.toString() } ?: emptyList(),
+                    (operation["x-burp-history-refs"] as? List<*>)?.mapNotNull { raw ->
+                        val ref = raw as? Map<*, *> ?: return@mapNotNull null
+                        val historyId = ref["historyId"]?.toString()?.toIntOrNull()?.takeIf { it > 0 }
+                        val packetId = ref["packetId"]?.toString()?.toLongOrNull()?.takeIf { it > 0 }
+                        if (historyId != null && packetId != null) OpenApiHistoryRef(historyId, packetId) else null
+                    } ?: emptyList(),
                     ((operation["servers"] ?: pathItem["servers"]) as? List<*>)?.mapNotNull {
                         (it as? Map<*, *>)?.get("url")?.toString()
                     } ?: emptyList())

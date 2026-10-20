@@ -99,7 +99,7 @@ object OpenApiRequestBuilder {
                 val example = media?.get("example") ?: (media?.get("examples") as? Map<*, *>)
                     ?.values?.firstOrNull()?.let { (it as? Map<*, *>)?.get("value") }
                 if (example != null) prettyJson.encodeToString(JsonElement.serializer(), toJson(example))
-                else exampleJson(media?.get("schema"), document.schemas)
+                else ""
             }
             else -> media?.get("example")?.toString().orEmpty()
         }
@@ -122,13 +122,7 @@ object OpenApiRequestBuilder {
         val schema = parameter["schema"] as? Map<*, *>
         val explicit = parameter["example"] ?: schema?.get("example") ?: schema?.get("default")
             ?: (schema?.get("enum") as? List<*>)?.firstOrNull()
-        if (explicit != null) return explicit.toString()
-        return when (schema?.get("type")?.toString()) {
-            "integer", "number" -> "0"
-            "boolean" -> "true"
-            "string" -> if (schema["pattern"]?.toString()?.contains("[0-9]") == true) "0" else "example"
-            else -> "example"
-        }
+        return explicit?.toString().orEmpty()
     }
 
     private fun encode(value: String): String = URLEncoder.encode(value, Charsets.UTF_8).replace("+", "%20")

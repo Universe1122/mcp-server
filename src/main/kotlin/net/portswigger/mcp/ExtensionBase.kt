@@ -57,12 +57,15 @@ class ExtensionBase : BurpExtension {
 
         val openApiViewer = OpenApiViewer(
             store = serverManager.openApiStore,
+            tagStore = serverManager.packetRepository,
             createRepeaterTab = { draft ->
                 val service = HttpService.httpService(draft.host, draft.port, draft.usesHttps)
                 val request = HttpRequest.httpRequest(service, draft.rawRequest)
                 api.repeater().sendToRepeater(request, draft.tabName)
             },
-            loadPacket = { id -> serverManager.packetRepository.getPacket(id, 1_048_576) },
+            loadPacket = { historyId, packetId ->
+                serverManager.packetRepository.getPacketByHistoryId(historyId, packetId, 1_048_576)
+            },
             sendPacketToRepeater = { packet -> sendSavedPacketToRepeater(api, packet) },
             createPacketRequestEditor = { packet ->
                 api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY).apply {

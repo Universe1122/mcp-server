@@ -81,9 +81,34 @@ data class PacketSummary(
     val similarCount: Int = 1,
 )
 
+data class SwaggerPacketSearchHit(
+    val packetId: Long,
+    val historyId: Int?,
+    val method: String,
+    val url: String,
+    val statusCode: Int?,
+    val location: String,
+    val snippet: String,
+)
+
+data class SwaggerPacketSearchPage(
+    val hits: List<SwaggerPacketSearchHit>,
+    val hasMore: Boolean,
+    val nextBeforeId: Long?,
+)
+
+private fun matchingHeaderLine(headers: String?, query: String): String {
+    val line = headers?.lineSequence()?.firstOrNull { it.contains(query, ignoreCase = true) }?.trim()
+        ?: return "Header match"
+    val name = line.substringBefore(':', "").trim()
+    return if (name.lowercase() in setOf("authorization", "proxy-authorization", "cookie", "set-cookie",
+            "x-api-key", "x-auth-token")) "$name: [redacted]" else line.take(240)
+}
+
 @Serializable
 data class PacketDetail(
     val id: Long,
+    val burpHistoryId: Int?,
     val host: String,
     val port: Int,
     val usesHttps: Boolean,
@@ -120,6 +145,16 @@ data class DatabaseSchema(
     val databasePath: String,
     val createStatements: Map<String, String>,
     val bodyStorage: String,
+)
+
+@Serializable
+data class EndpointInspectionTag(
+    val host: String,
+    val method: String,
+    val path: String,
+    val tag: String,
+    val source: String,
+    val updatedAt: String,
 )
 
 @Serializable
@@ -214,6 +249,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
     private val saveFailureCount = AtomicLong()
     private val historyCatchupCount = AtomicLong()
     private val inventoryListeners = CopyOnWriteArrayList<() -> Unit>()
+    private val inspectionTagRevision = AtomicLong()
     @Volatile private var captureGeneration = 0L
     @Volatile private var collecting = false
     @Volatile private var historyScanPhase = "idle"
@@ -273,6 +309,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             initialize(opened)
             connection = opened
             dbPath = path
+            inspectionTagRevision.incrementAndGet()
             notifyInventoryChanged()
             collecting = true
             val generation = captureGeneration
@@ -310,6 +347,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 connection?.close()
                 connection = null
                 dbPath = null
+                inspectionTagRevision.incrementAndGet()
                 historyPosition = 0
                 lastHistoryId = null
                 pendingResponsePositions.clear()
@@ -328,6 +366,55 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
     @Synchronized
     fun projectDirectory(): Path? = dbPath?.parent
 
+    fun inspectionTagRevision(): Long = inspectionTagRevision.get()
+
+    @Synchronized
+    fun endpointInspectionTags(host: String): List<EndpointInspectionTag> {
+        val normalizedHost = normalizeTagHost(host)
+        val db = requireDb()
+        db.prepareStatement("SELECT host,method,path,tag,source,updated_at FROM endpoint_inspection_tags WHERE host=? ORDER BY method,path").use { st ->
+            st.setString(1, normalizedHost)
+            st.executeQuery().use { rows ->
+                return buildList {
+                    while (rows.next()) add(EndpointInspectionTag(
+                        rows.getString("host"), rows.getString("method"), rows.getString("path"),
+                        rows.getString("tag"), rows.getString("source"), rows.getString("updated_at"),
+                    ))
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun setEndpointInspectionTag(host: String, method: String, path: String, tag: String?, source: String): EndpointInspectionTag? {
+        val normalizedHost = normalizeTagHost(host)
+        val normalizedMethod = method.uppercase()
+        require(normalizedMethod in setOf("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE")) { "Unsupported HTTP method" }
+        require(path.startsWith('/') && path.length <= 2048 && path.none { it.isWhitespace() || it.isISOControl() }) { "Invalid OpenAPI path" }
+        require(tag == null || tag == "VULN" || tag == "SAFE") { "tag must be VULN, SAFE, or null to clear" }
+        require(source == "agent" || source == "human") { "Invalid tag source" }
+        val db = requireDb()
+        if (tag == null) {
+            db.prepareStatement("DELETE FROM endpoint_inspection_tags WHERE host=? AND method=? AND path=?").use { st ->
+                st.setString(1, normalizedHost); st.setString(2, normalizedMethod); st.setString(3, path)
+                st.executeUpdate()
+            }
+            inspectionTagRevision.incrementAndGet()
+            return null
+        }
+        val updatedAt = Instant.now().toString()
+        db.prepareStatement("""
+            INSERT INTO endpoint_inspection_tags(host,method,path,tag,source,updated_at) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(host,method,path) DO UPDATE SET tag=excluded.tag,source=excluded.source,updated_at=excluded.updated_at
+        """).use { st ->
+            st.setString(1, normalizedHost); st.setString(2, normalizedMethod); st.setString(3, path)
+            st.setString(4, tag); st.setString(5, source); st.setString(6, updatedAt)
+            st.executeUpdate()
+        }
+        inspectionTagRevision.incrementAndGet()
+        return EndpointInspectionTag(normalizedHost, normalizedMethod, path, tag, source, updatedAt)
+    }
+
     @Synchronized
     fun count(): Long {
         val db = connection ?: return 0
@@ -341,7 +428,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         val db = connection ?: return DatabaseInfo(status(), emptyMap())
         val tables = listOf(
             "burp_packets", "packet_blobs", "packet_body_fts",
-            "api_route_summary", "api_route_status_codes", "packet_changes",
+            "packet_history_refs", "api_route_summary", "api_route_status_codes", "packet_changes", "endpoint_inspection_tags",
         ).associateWith { name ->
             db.createStatement().use { st ->
                 st.executeQuery("PRAGMA table_info($name)").use { rs ->
@@ -359,7 +446,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         db.prepareStatement("""
             SELECT name, sql FROM sqlite_master
             WHERE type='table' AND name IN
-              ('burp_packets','packet_blobs','packet_body_fts','api_route_summary','api_route_status_codes','packet_changes')
+              ('burp_packets','packet_blobs','packet_body_fts','api_route_summary','api_route_status_codes','packet_changes','endpoint_inspection_tags')
             ORDER BY name
         """).use { st ->
             st.executeQuery().use { rs -> while (rs.next()) statements[rs.getString("name")] = rs.getString("sql") }
@@ -402,6 +489,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 )
                 return PacketDetail(
                     id = id,
+                    burpHistoryId = rs.intOrNull("burp_id"),
                     host = rs.getString("host"), port = rs.getInt("port"),
                     usesHttps = rs.getInt("uses_https") != 0, method = rs.getString("method"),
                     url = rs.getString("url"), statusCode = rs.intOrNull("status_code"),
@@ -418,6 +506,20 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 )
             }
         }
+    }
+
+    @Synchronized
+    fun getPacketByHistoryId(historyId: Int, packetId: Long, maxBodyBytes: Int = 65_536): PacketDetail? {
+        require(historyId > 0) { "historyId must be positive" }
+        require(packetId > 0) { "packetId must be positive" }
+        val db = requireDb()
+        val linked = db.prepareStatement("SELECT 1 FROM packet_history_refs WHERE history_id=? AND packet_id=?").use { st ->
+            st.setInt(1, historyId)
+            st.setLong(2, packetId)
+            st.executeQuery().use { rs -> rs.next() }
+        }
+        if (!linked) return null
+        return getPacket(packetId, maxBodyBytes)?.copy(burpHistoryId = historyId)
     }
 
     @Synchronized
@@ -621,6 +723,80 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             st.setInt(i, offset)
             st.executeQuery().use { rs -> return buildList { while (rs.next()) add(rs.summary()) } }
         }
+        }
+    }
+
+    /** Bounded, newest-first literal search for the Swagger viewer. Bodies use the shared FTS index. */
+    fun searchSwaggerPackets(host: String, query: String, beforeId: Long = Long.MAX_VALUE,
+                             limit: Int = 100): SwaggerPacketSearchPage {
+        require(host.isNotBlank()) { "host is required" }
+        require(query.length in 3..200) { "query length must be between 3 and 200" }
+        require(beforeId > 0 && limit in 1..200) { "Invalid search page" }
+        val literal = query.lowercase()
+        val ftsPhrase = "\"${query.replace("\"", "\"\"")}\""
+        val sql = """
+            WITH body_hits AS (
+                SELECT b.hash, snippet(packet_body_fts,0,'<<<','>>>','…',12) AS excerpt
+                FROM packet_body_fts JOIN packet_blobs b ON b.rowid=packet_body_fts.rowid
+                WHERE packet_body_fts MATCH ?
+            )
+            SELECT p.id,p.method,p.url,p.status_code,p.request_head,p.response_head,
+                   (SELECT MAX(r.history_id) FROM packet_history_refs r WHERE r.packet_id=p.id) AS history_id,
+                   CASE WHEN instr(lower(p.url),?)>0 THEN 'URL'
+                        WHEN instr(lower(CAST(p.request_head AS TEXT)),?)>0 THEN 'Request headers'
+                        WHEN instr(lower(CAST(p.response_head AS TEXT)),?)>0 THEN 'Response headers'
+                        WHEN req.hash IS NOT NULL THEN 'Request body'
+                        ELSE 'Response body' END AS location,
+                   CASE WHEN instr(lower(p.url),?)>0 THEN substr(p.url,1,240)
+                        WHEN req.hash IS NOT NULL THEN substr(req.excerpt,1,240)
+                        WHEN res.hash IS NOT NULL THEN substr(res.excerpt,1,240)
+                        ELSE '' END AS excerpt
+            FROM burp_packets p
+            LEFT JOIN body_hits req ON req.hash=p.request_body_hash
+            LEFT JOIN body_hits res ON res.hash=p.response_body_hash
+            WHERE p.host=? AND p.id<? AND (
+                instr(lower(p.url),?)>0 OR
+                instr(lower(CAST(p.request_head AS TEXT)),?)>0 OR
+                instr(lower(CAST(p.response_head AS TEXT)),?)>0 OR
+                req.hash IS NOT NULL OR res.hash IS NOT NULL
+            )
+            ORDER BY p.id DESC LIMIT ?
+        """.trimIndent()
+        openReader().use { reader ->
+            reader.prepareStatement(sql).use { st ->
+                st.queryTimeout = 5
+                st.setString(1, ftsPhrase)
+                st.setString(2, literal)
+                st.setString(3, literal)
+                st.setString(4, literal)
+                st.setString(5, literal)
+                st.setString(6, host.lowercase())
+                st.setLong(7, beforeId)
+                st.setString(8, literal)
+                st.setString(9, literal)
+                st.setString(10, literal)
+                st.setInt(11, limit + 1)
+                st.executeQuery().use { rows ->
+                    val found = buildList {
+                        while (rows.next()) {
+                            val historyId = rows.getInt("history_id").let { if (rows.wasNull()) null else it }
+                            val statusCode = rows.getInt("status_code").let { if (rows.wasNull()) null else it }
+                            val location = rows.getString("location")
+                            val excerpt = when (location) {
+                                "Request headers" -> matchingHeaderLine(rows.getString("request_head"), literal)
+                                "Response headers" -> matchingHeaderLine(rows.getString("response_head"), literal)
+                                else -> rows.getString("excerpt") ?: ""
+                            }
+                            add(SwaggerPacketSearchHit(rows.getLong("id"), historyId, rows.getString("method"),
+                                rows.getString("url"), statusCode, location, excerpt))
+                        }
+                    }
+                    val hasMore = found.size > limit
+                    val page = found.take(limit)
+                    return SwaggerPacketSearchPage(page, hasMore,
+                        if (hasMore) page.lastOrNull()?.packetId else null)
+                }
+            }
         }
     }
 
@@ -1055,13 +1231,15 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         db.prepareStatement("SELECT id,is_sent_from_mcp FROM burp_packets WHERE fingerprint=?").use { st ->
             st.setString(1, fingerprint)
             st.executeQuery().use { rs -> if (rs.next()) {
+                val existingId = rs.getLong("id")
                 // A request sent through MCP may later be observed in Proxy. Keep the observed origin.
                 if (!sent && rs.getInt("is_sent_from_mcp") != 0) db.prepareStatement("UPDATE burp_packets SET is_sent_from_mcp=0,burp_id=COALESCE(burp_id,?) WHERE id=?").use { update ->
                     if (burpId == null) update.setNull(1, java.sql.Types.INTEGER) else update.setInt(1, burpId)
-                    update.setLong(2, rs.getLong(1))
+                    update.setLong(2, existingId)
                     update.executeUpdate()
                     notifyInventoryChanged()
                 }
+                if (burpId != null) saveHistoryReference(db, burpId, existingId)
                 return null
             } }
         }
@@ -1087,6 +1265,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                     return null
                 }
                 val id = st.generatedKeys.use { rs -> if (rs.next()) rs.getLong(1) else null }
+                if (id != null && burpId != null) saveHistoryReference(db, burpId, id)
                 db.commit()
                 notifyInventoryChanged()
                 return id
@@ -1187,10 +1366,32 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 )
             """)
             st.execute("CREATE INDEX IF NOT EXISTS idx_packets_host ON burp_packets(host)")
+            st.execute("CREATE INDEX IF NOT EXISTS idx_packets_host_id ON burp_packets(host,id DESC)")
             st.execute("CREATE INDEX IF NOT EXISTS idx_packets_url ON burp_packets(url)")
             st.execute("CREATE INDEX IF NOT EXISTS idx_packets_referer ON burp_packets(referer)")
+            val oldHistoryRefs = st.executeQuery("SELECT sql FROM sqlite_master WHERE type='table' AND name='packet_history_refs'").use { rs ->
+                if (rs.next()) rs.getString(1) else null
+            }
+            if (oldHistoryRefs?.contains("history_id INTEGER PRIMARY KEY") == true) {
+                st.execute("CREATE TABLE packet_history_refs_new(history_id INTEGER NOT NULL,packet_id INTEGER NOT NULL REFERENCES burp_packets(id),PRIMARY KEY(history_id,packet_id))")
+                st.execute("INSERT OR IGNORE INTO packet_history_refs_new SELECT history_id,packet_id FROM packet_history_refs")
+                st.execute("DROP TABLE packet_history_refs")
+                st.execute("ALTER TABLE packet_history_refs_new RENAME TO packet_history_refs")
+            }
+            st.execute("CREATE TABLE IF NOT EXISTS packet_history_refs(history_id INTEGER NOT NULL,packet_id INTEGER NOT NULL REFERENCES burp_packets(id),PRIMARY KEY(history_id,packet_id))")
+            st.execute("CREATE INDEX IF NOT EXISTS idx_history_refs_packet ON packet_history_refs(packet_id)")
+            st.execute("INSERT OR IGNORE INTO packet_history_refs(history_id,packet_id) SELECT burp_id,id FROM burp_packets WHERE burp_id IS NOT NULL")
             st.execute("CREATE VIRTUAL TABLE IF NOT EXISTS packet_body_fts USING fts5(body_text,tokenize='trigram')")
             st.execute("CREATE TABLE IF NOT EXISTS capture_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+            st.execute("""
+                CREATE TABLE IF NOT EXISTS endpoint_inspection_tags(
+                    host TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,
+                    tag TEXT NOT NULL CHECK(tag IN ('VULN','SAFE')),
+                    source TEXT NOT NULL CHECK(source IN ('agent','human')),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(host,method,path)
+                )
+            """)
             // The former Python collector left this INSERT trigger on some databases after
             // their packet table was migrated. It references columns absent from this schema
             // and makes every new Proxy response fail to save.
@@ -1203,6 +1404,20 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         initializeInventory(db)
         initializePacketChanges(db)
     }
+
+    private fun saveHistoryReference(db: Connection, historyId: Int, packetId: Long) {
+        db.prepareStatement("INSERT OR IGNORE INTO packet_history_refs(history_id,packet_id) VALUES(?,?)").use { st ->
+            st.setInt(1, historyId)
+            st.setLong(2, packetId)
+            st.executeUpdate()
+        }
+    }
+}
+
+private fun normalizeTagHost(host: String): String {
+    val normalized = host.trim().lowercase()
+    require(normalized.length in 1..253 && normalized.matches(Regex("[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?"))) { "Invalid host" }
+    return normalized
 }
 
 private fun ResultSet.intOrNull(column: String): Int? = getInt(column).let { if (wasNull()) null else it }

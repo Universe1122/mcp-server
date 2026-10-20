@@ -104,7 +104,7 @@ class McpServerIntegrationTest {
             assertTrue(client.listResourceUris().contains("burp-mcp://skills/openapi-from-packets"))
             val methodology = client.readResource("burp-mcp://skills/openapi-from-packets")
             assertTrue(methodology.contains("cafe.naver.com"))
-            assertTrue(methodology.contains("x-burp-packet-ids"))
+            assertTrue(methodology.contains("x-burp-history-refs"))
             assertTrue(client.listPromptNames().contains("build_openapi_from_packets"))
             
             val pingResult = client.ping()

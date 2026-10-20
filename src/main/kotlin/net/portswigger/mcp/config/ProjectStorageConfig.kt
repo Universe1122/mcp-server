@@ -22,9 +22,15 @@ class ProjectStorageConfig {
         require(file.fileName.toString() == "config.yaml") { "configPath must name config.yaml" }
         require(Files.isRegularFile(file) && !Files.isSymbolicLink(file)) { "config.yaml does not exist: $file" }
         require(Files.size(file) <= 1_048_576) { "config.yaml is too large" }
+        return validateText(file, Files.readString(file)).also { paths = it }
+    }
+
+    fun validateText(file: Path, text: String): ProjectStoragePaths {
+        require(file.fileName.toString() == "config.yaml") { "configPath must name config.yaml" }
+        require(text.toByteArray(Charsets.UTF_8).size <= 1_048_576) { "config.yaml is too large" }
         val settings = LoadSettings.builder().setAllowDuplicateKeys(false).setMaxAliasesForCollections(20)
             .setCodePointLimit(1_048_576).build()
-        val root = Load(settings).loadFromString(Files.readString(file)) as? Map<*, *>
+        val root = Load(settings).loadFromString(text) as? Map<*, *>
             ?: throw IllegalArgumentException("config.yaml must be a YAML object")
         val storage = root["storage"] as? Map<*, *>
             ?: throw IllegalArgumentException("config.yaml requires storage.db_dir and storage.openapi_dir")
@@ -39,6 +45,6 @@ class ProjectStorageConfig {
         }
         val db = directory("db_dir", true)
         val openapi = directory("openapi_dir", false)
-        return ProjectStoragePaths(file.toString(), db.toString(), openapi.toString()).also { paths = it }
+        return ProjectStoragePaths(file.toString(), db.toString(), openapi.toString())
     }
 }

@@ -38,7 +38,8 @@ class OpenApiRequestBuilderTest {
         assertTrue(draft.rawRequest.contains("Host: api.example.com:8443\r\n"))
         assertTrue(draft.rawRequest.contains("X-Trace: {X-Trace}\r\n"))
         assertTrue(draft.rawRequest.contains("Content-Type: application/json\r\n"))
-        assertTrue(draft.rawRequest.contains("\"name\": \"string\""))
+        assertFalse(draft.rawRequest.contains("\"name\": \"string\""))
+        assertTrue(draft.rawRequest.endsWith("\r\n\r\n"))
         assertFalse(draft.rawRequest.contains("optional="))
     }
 

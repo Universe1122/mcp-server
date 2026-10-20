@@ -29,6 +29,55 @@ import java.util.concurrent.TimeUnit
 
 class PacketRepositoryTest {
     @Test
+    fun `Swagger packet search finds URL headers and body with keyset paging`(@TempDir project: Path) {
+        val api = mockk<MontoyaApi>(relaxed = true)
+        every { api.proxy().history() } returns listOf(
+            item(10, "X-Search: crimson\r\n", path = "/items?filter=needle"),
+            item(11, "", path = "/alpha"),
+        )
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            val url = packets.searchSwaggerPackets("example.com", "needle")
+            assertEquals(listOf(10), url.hits.map { it.historyId })
+            assertEquals("URL", url.hits.single().location)
+            val header = packets.searchSwaggerPackets("example.com", "crimson").hits.single()
+            assertEquals("Request headers", header.location)
+            assertTrue(header.snippet.contains("X-Search: crimson"))
+            val first = packets.searchSwaggerPackets("example.com", "alpha", limit = 1)
+            assertEquals(11, first.hits.single().historyId)
+            assertTrue(first.hasMore)
+            val second = packets.searchSwaggerPackets("example.com", "alpha", beforeId = first.nextBeforeId!!, limit = 1)
+            assertEquals(10, second.hits.single().historyId)
+            assertEquals("Response body", second.hits.single().location)
+            assertFalse(second.hasMore)
+            assertTrue(packets.searchSwaggerPackets("other.example", "alpha").hits.isEmpty())
+        }
+    }
+
+    @Test
+    fun `endpoint inspection tags survive database reconnection and can be revised`(@TempDir project: Path) {
+        val api = mockk<MontoyaApi>(relaxed = true)
+        every { api.proxy().history() } returns emptyList()
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            val first = packets.setEndpointInspectionTag("Example.COM", "get", "/v1/users/{id}", "VULN", "agent")!!
+            assertEquals("example.com", first.host)
+            assertEquals("GET", first.method)
+            packets.start(project.toString())
+            assertEquals("VULN", packets.endpointInspectionTags("example.com").single().tag)
+            packets.setEndpointInspectionTag("example.com", "GET", "/v1/users/{id}", "SAFE", "human")
+            assertEquals("human", packets.endpointInspectionTags("example.com").single().source)
+            packets.setEndpointInspectionTag("example.com", "GET", "/v1/users/{id}", null, "human")
+            assertTrue(packets.endpointInspectionTags("example.com").isEmpty())
+        }
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            assertTrue(packets.endpointInspectionTags("example.com").isEmpty())
+            assertTrue(packets.schema().createStatements.containsKey("endpoint_inspection_tags"))
+        }
+    }
+
+    @Test
     fun `schema and paged HAR export expose stored packets`(@TempDir project: Path) {
         val api = mockk<MontoyaApi>(relaxed = true)
         every { api.proxy().history() } returns listOf(item(10, ""), item(11, "X-Variant: second\r\n"))
@@ -105,6 +154,33 @@ class PacketRepositoryTest {
             val exports = packets.savePackets(listOf(matches.first().id), project.resolve("export").toString())
             val savedResponse = Path.of(exports.first().getValue("responsePath"))
             assertArrayEquals(responseRaw, Files.readAllBytes(savedResponse))
+        }
+    }
+
+    @Test
+    fun `duplicate history entries retain distinct history references`(@TempDir project: Path) {
+        val api = mockk<MontoyaApi>(relaxed = true)
+        every { api.proxy().history() } returns listOf(item(10, ""), item(11, ""))
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            assertEquals(1, packets.count())
+            assertEquals(1L, packets.getPacketByHistoryId(10, 1)?.id)
+            assertEquals(11, packets.getPacketByHistoryId(11, 1)?.burpHistoryId)
+            assertNull(packets.getPacketByHistoryId(10, 2))
+            assertEquals(2, packets.querySelect("SELECT history_id FROM packet_history_refs ORDER BY history_id", 10).rows.size)
+        }
+    }
+
+    @Test
+    fun `reused Burp history number keeps both packet mappings`(@TempDir project: Path) {
+        val api = mockk<MontoyaApi>(relaxed = true)
+        every { api.proxy().history() } returns listOf(item(10, ""), item(10, "X-Variant: second\r\n"))
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            assertEquals(2, packets.count())
+            assertEquals(1L, packets.getPacketByHistoryId(10, 1)?.id)
+            assertEquals(2L, packets.getPacketByHistoryId(10, 2)?.id)
+            assertEquals(2, packets.querySelect("SELECT packet_id FROM packet_history_refs WHERE history_id=10", 10).rows.size)
         }
     }
 

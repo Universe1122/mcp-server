@@ -81,7 +81,7 @@ fun Server.registerPacketTools(packets: PacketRepository, storage: ProjectStorag
     mcpTool<GetApiInventory>(
         "Return a paged inventory of exact observed METHOD + path routes for one host. " +
             "Includes counts, status codes, body/query flags, sample MIME and URL, and source packet database IDs. " +
-            "When writing OpenAPI, put at most 20 representative database IDs in each operation's x-burp-packet-ids, newest ID first. " +
+            "For OpenAPI x-burp-history-refs, resolve these DB IDs through packet_history_refs and record verified {historyId, packetId} pairs, at most 20 per operation. " +
             "Pass nextCursor unchanged for the next page; the cursor fixes route discovery to a DB packet ID and its filters. " +
             "Counts and status summaries for already discovered routes reflect the latest saved packets. " +
             "Paths are not guessed or merged into templates."

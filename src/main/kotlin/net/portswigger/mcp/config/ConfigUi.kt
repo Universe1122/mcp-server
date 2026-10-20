@@ -49,6 +49,7 @@ class ConfigUi(private val config: McpConfig, private val providers: List<Provid
     private lateinit var advancedOptionsPanel: AdvancedOptionsPanel
     private lateinit var autoApproveTargetsPanel: AutoApproveTargetsPanel
     private lateinit var installationPanel: InstallationPanel
+    private val projectConfigEditor = ProjectConfigEditor(config)
 
     private var toggleListener: ((Boolean) -> Unit)? = null
     private var suppressToggleEvents: Boolean = false
@@ -201,6 +202,8 @@ class ConfigUi(private val config: McpConfig, private val providers: List<Provid
 
         rightPanelContent.add(createVerticalStrut(15))
         rightPanelContent.add(advancedOptionsPanel)
+        rightPanelContent.add(createVerticalStrut(Design.Spacing.LG))
+        rightPanelContent.add(projectConfigEditor)
         rightPanelContent.add(createVerticalGlue())
         rightPanelContent.add(reinstallNotice)
         rightPanelContent.add(createVerticalStrut(10))
