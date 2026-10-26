@@ -13,6 +13,7 @@ class OpenApiSearchTest {
         assertTrue(matchesOpenApiSearch(operation, null, "stockCount"))
         assertTrue(matchesOpenApiSearch(operation, null, "등록된"))
         assertTrue(matchesOpenApiSearch(operation, "VULN", "vuln"))
+        assertTrue(matchesOpenApiSearch(operation, "SUSPECT", "suspect"))
         assertFalse(matchesOpenApiSearch(operation, null, "vuln"))
         val referenced = operation.copy(responses = mapOf("200" to mapOf("schema" to mapOf(
             "\$ref" to "#/components/schemas/Item"))))
@@ -27,5 +28,25 @@ class OpenApiSearchTest {
         assertEquals(literal, matchingOpenApiOperation(listOf(dynamic, literal), "GET", "https://example.com/items/stats?q=1"))
         assertEquals(dynamic, matchingOpenApiOperation(listOf(dynamic, literal), "GET", "https://example.com/items/42"))
         assertNull(matchingOpenApiOperation(listOf(dynamic, literal), "POST", "https://example.com/items/42"))
+    }
+
+    @Test
+    fun `server selection isolates port and respects base path`() {
+        val operation = OpenApiOperation("GET", "/items/{id}", "", "", emptyList(), "")
+        val document = OpenApiDocument(OpenApiSpecInfo("example.com", "", "", "Example", "1", 1, ""),
+            listOf(operation), servers = listOf("https://example.com", "https://example.com:12345/api"))
+        val servers = documentServers(document)
+        assertEquals(2, servers.size)
+        val alternate = servers.single { it.port == 12345 }
+        assertTrue(supportsServer(document, operation, alternate))
+        assertTrue(packetMatchesServer("https://example.com:12345/api/items/5", 12345, true, alternate))
+        assertFalse(packetMatchesServer("https://example.com/api/items/5", 443, true, alternate))
+        assertEquals(operation, matchingOpenApiOperation(document.operations, "GET",
+            "https://example.com:12345/api/items/5", alternate))
+        assertNull(matchingOpenApiOperation(document.operations, "GET",
+            "https://example.com:12345/items/5", alternate))
+        val draft = OpenApiRequestBuilder.build(document, operation, serverUrl = alternate.url)
+        assertEquals(12345, draft.port)
+        assertTrue(draft.rawRequest.startsWith("GET /api/items/{id} HTTP/1.1\r\n"))
     }
 }

@@ -80,10 +80,11 @@ class ExtensionBase : BurpExtension {
         )
         val inventoryViewer = ApiInventoryViewer(serverManager.packetRepository)
         val mcpTabs = JTabbedPane().apply {
+            // Host relationship preview is paused; keep its implementation available for later.
             addTab("Inventory", inventoryViewer)
             addTab("Swagger", openApiViewer)
             addTab("Settings", configUi.component)
-            selectedIndex = 1
+            selectedIndex = 0
         }
         api.userInterface().registerSuiteTab("MCP", mcpTabs)
 

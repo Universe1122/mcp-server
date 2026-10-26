@@ -55,25 +55,130 @@ class PacketRepositoryTest {
     }
 
     @Test
+    fun `Swagger search and endpoint tags distinguish ports`(@TempDir project: Path) {
+        val api = mockk<MontoyaApi>(relaxed = true)
+        every { api.proxy().history() } returns listOf(
+            item(20, "X-Match: portneedle\r\n", path = "/items", port = 443),
+            item(21, "X-Match: portneedle\r\n", path = "/items", port = 12345),
+        )
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            assertEquals(listOf(20), packets.searchSwaggerPackets("example.com", "portneedle",
+                port = 443, usesHttps = true).hits.mapNotNull { it.historyId })
+            assertEquals(listOf(21), packets.searchSwaggerPackets("example.com", "portneedle",
+                port = 12345, usesHttps = true).hits.mapNotNull { it.historyId })
+            val packetIds = packets.searchSwaggerPackets("example.com", "portneedle").hits.map { it.packetId }
+            assertEquals(1, packets.packetUrlsForServer(packetIds, "example.com", 12345, true).size)
+            packets.setEndpointInspectionTag("example.com", "GET", "/items", "SAFE", "human", "https://example.com:443")
+            packets.setEndpointInspectionTag("example.com", "GET", "/items", "VULN", "human", "https://example.com:12345")
+            assertEquals("SAFE", packets.endpointInspectionTags("example.com", "https://example.com:443").single().tag)
+            assertEquals("VULN", packets.endpointInspectionTags("example.com", "https://example.com:12345").single().tag)
+            packets.setEndpointInspectionTag("example.com", "GET", "/items", "VULN", "agent", "https://example.com/v1")
+            packets.setEndpointInspectionTag("example.com", "GET", "/items", "SAFE", "agent", "https://example.com/v2/")
+            assertEquals("VULN", packets.endpointInspectionTags("example.com", "https://example.com:443/v1").single().tag)
+            assertEquals("SAFE", packets.endpointInspectionTags("example.com", "https://example.com/v2").single().tag)
+            assertEquals(4, packets.endpointInspectionTags("example.com").size)
+        }
+    }
+
+    @Test
+    fun `legacy endpoint tags migrate without losing decisions`(@TempDir project: Path) {
+        val api = mockk<MontoyaApi>(relaxed = true)
+        every { api.proxy().history() } returns emptyList()
+        PacketRepository(api).use { it.start(project.toString()); it.stop(closeDatabase = true) }
+        DriverManager.getConnection("jdbc:sqlite:${project.resolve("packets.sqlite3")}").use { db ->
+            db.createStatement().use { st ->
+                st.execute("DROP TABLE endpoint_inspection_tags")
+                st.execute("DROP TABLE endpoint_inspection_tag_events")
+                st.execute("CREATE TABLE endpoint_inspection_tags(host TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,tag TEXT NOT NULL,source TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(host,method,path))")
+                st.execute("INSERT INTO endpoint_inspection_tags VALUES('example.com','GET','/items','SAFE','human','2026-01-01')")
+            }
+        }
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            val tag = packets.endpointInspectionTags("example.com").single()
+            assertEquals("SAFE", tag.tag)
+            assertEquals("", tag.serverUrl)
+            assertTrue(packets.endpointInspectionTags("example.com", "https://example.com:12345").isEmpty())
+        }
+    }
+
+    @Test
+    fun `origin tags migrate to root server without applying to base paths`(@TempDir project: Path) {
+        val api = mockk<MontoyaApi>(relaxed = true)
+        every { api.proxy().history() } returns emptyList()
+        PacketRepository(api).use { it.start(project.toString()); it.stop(closeDatabase = true) }
+        DriverManager.getConnection("jdbc:sqlite:${project.resolve("packets.sqlite3")}").use { db ->
+            db.createStatement().use { st ->
+                st.execute("DROP TABLE endpoint_inspection_tags")
+                st.execute("DROP TABLE endpoint_inspection_tag_events")
+                st.execute("CREATE TABLE endpoint_inspection_tags(host TEXT NOT NULL,server_origin TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,tag TEXT NOT NULL,source TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(host,server_origin,method,path))")
+                st.execute("INSERT INTO endpoint_inspection_tags VALUES('example.com','https://example.com:443','GET','/items','VULN','agent','2026-01-01')")
+            }
+        }
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            assertEquals("VULN", packets.endpointInspectionTags("example.com", "https://example.com").single().tag)
+            assertTrue(packets.endpointInspectionTags("example.com", "https://example.com/v1").isEmpty())
+            val baseline = packets.endpointTagHistory("example.com", "https://example.com", "GET", "/items").single()
+            assertEquals(null, baseline.oldTag)
+            assertEquals("VULN", baseline.newTag)
+        }
+    }
+
+    @Test
+    fun `two tag schema migrates and accepts SUSPECT without losing history`(@TempDir project: Path) {
+        val api = mockk<MontoyaApi>(relaxed = true)
+        every { api.proxy().history() } returns emptyList()
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            packets.setEndpointInspectionTag("example.com", "GET", "/items", "VULN", "agent", "https://example.com/v1")
+            packets.stop(closeDatabase = true)
+        }
+        DriverManager.getConnection("jdbc:sqlite:${project.resolve("packets.sqlite3")}").use { db ->
+            db.createStatement().use { st ->
+                st.execute("ALTER TABLE endpoint_inspection_tags RENAME TO endpoint_inspection_tags_previous")
+                st.execute("CREATE TABLE endpoint_inspection_tags(host TEXT NOT NULL,server_url TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,tag TEXT NOT NULL CHECK(tag IN ('VULN','SAFE')),source TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(host,server_url,method,path))")
+                st.execute("INSERT INTO endpoint_inspection_tags SELECT * FROM endpoint_inspection_tags_previous")
+                st.execute("DROP TABLE endpoint_inspection_tags_previous")
+            }
+        }
+        PacketRepository(api).use { packets ->
+            packets.start(project.toString())
+            assertEquals("VULN", packets.endpointInspectionTags("example.com", "https://example.com/v1").single().tag)
+            packets.setEndpointInspectionTag("example.com", "GET", "/items", "SUSPECT", "human", "https://example.com/v1")
+            assertEquals("SUSPECT", packets.endpointInspectionTags("example.com", "https://example.com/v1").single().tag)
+            assertEquals(listOf("VULN" to "SUSPECT", null to "VULN"),
+                packets.endpointTagHistory("example.com", "https://example.com/v1", "GET", "/items").map { it.oldTag to it.newTag })
+        }
+    }
+
+    @Test
     fun `endpoint inspection tags survive database reconnection and can be revised`(@TempDir project: Path) {
         val api = mockk<MontoyaApi>(relaxed = true)
         every { api.proxy().history() } returns emptyList()
         PacketRepository(api).use { packets ->
             packets.start(project.toString())
-            val first = packets.setEndpointInspectionTag("Example.COM", "get", "/v1/users/{id}", "VULN", "agent")!!
+            val first = packets.setEndpointInspectionTag("Example.COM", "get", "/v1/users/{id}", "VULN", "agent", "https://example.com/v1")!!
             assertEquals("example.com", first.host)
             assertEquals("GET", first.method)
             packets.start(project.toString())
             assertEquals("VULN", packets.endpointInspectionTags("example.com").single().tag)
-            packets.setEndpointInspectionTag("example.com", "GET", "/v1/users/{id}", "SAFE", "human")
+            packets.setEndpointInspectionTag("example.com", "GET", "/v1/users/{id}", "SUSPECT", "agent", "https://example.com/v1")
+            assertEquals("SUSPECT", packets.endpointInspectionTags("example.com").single().tag)
+            packets.setEndpointInspectionTag("example.com", "GET", "/v1/users/{id}", "SAFE", "human", "https://example.com/v1")
             assertEquals("human", packets.endpointInspectionTags("example.com").single().source)
-            packets.setEndpointInspectionTag("example.com", "GET", "/v1/users/{id}", null, "human")
+            packets.setEndpointInspectionTag("example.com", "GET", "/v1/users/{id}", null, "human", "https://example.com/v1")
             assertTrue(packets.endpointInspectionTags("example.com").isEmpty())
+            val events = packets.endpointTagHistory("example.com", "https://example.com/v1", "GET", "/v1/users/{id}")
+            assertEquals(listOf("SAFE" to null, "SUSPECT" to "SAFE", "VULN" to "SUSPECT", null to "VULN"), events.map { it.oldTag to it.newTag })
+            assertEquals(listOf("human", "human", "agent", "agent"), events.map { it.source })
         }
         PacketRepository(api).use { packets ->
             packets.start(project.toString())
             assertTrue(packets.endpointInspectionTags("example.com").isEmpty())
             assertTrue(packets.schema().createStatements.containsKey("endpoint_inspection_tags"))
+            assertEquals(4, packets.endpointTagHistory("example.com", "https://example.com/v1", "GET", "/v1/users/{id}").size)
         }
     }
 
@@ -160,13 +265,13 @@ class PacketRepositoryTest {
     @Test
     fun `duplicate history entries retain distinct history references`(@TempDir project: Path) {
         val api = mockk<MontoyaApi>(relaxed = true)
-        every { api.proxy().history() } returns listOf(item(10, ""), item(11, ""))
+        every { api.proxy().history() } returns listOf(item(0, ""), item(11, ""))
         PacketRepository(api).use { packets ->
             packets.start(project.toString())
             assertEquals(1, packets.count())
-            assertEquals(1L, packets.getPacketByHistoryId(10, 1)?.id)
+            assertEquals(1L, packets.getPacketByHistoryId(0, 1)?.id)
             assertEquals(11, packets.getPacketByHistoryId(11, 1)?.burpHistoryId)
-            assertNull(packets.getPacketByHistoryId(10, 2))
+            assertNull(packets.getPacketByHistoryId(0, 2))
             assertEquals(2, packets.querySelect("SELECT history_id FROM packet_history_refs ORDER BY history_id", 10).rows.size)
         }
     }
@@ -480,10 +585,11 @@ class PacketRepositoryTest {
         }
     }
 
-    private fun item(id: Int, extraHeader: String, body: ByteArray = responseBody, path: String = "/a"): ProxyHttpRequestResponse {
+    private fun item(id: Int, extraHeader: String, body: ByteArray = responseBody, path: String = "/a",
+                     port: Int = 443): ProxyHttpRequestResponse {
         val service = mockk<HttpService>()
         every { service.host() } returns "example.com"
-        every { service.port() } returns 443
+        every { service.port() } returns port
         every { service.secure() } returns true
 
         val request = mockk<HttpRequest>()
@@ -493,7 +599,7 @@ class PacketRepositoryTest {
         every { request.bodyOffset() } returns requestRaw.size
         every { request.body() } returns burpBytes(byteArrayOf())
         every { request.method() } returns "GET"
-        every { request.url() } returns "https://example.com$path"
+        every { request.url() } returns "https://example.com${if (port == 443) "" else ":$port"}$path"
         every { request.path() } returns path
         every { request.headerValue("Content-Type") } returns null
         every { request.headerValue("Referer") } returns "https://example.com/page"

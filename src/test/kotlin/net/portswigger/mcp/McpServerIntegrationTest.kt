@@ -97,7 +97,7 @@ class McpServerIntegrationTest {
             assertTrue(toolNames.contains("output_project_options"), "Server should have output_project_options tool")
             assertTrue(toolNames.contains("output_user_options"), "Server should have output_user_options tool")
             assertTrue(toolNames.containsAll(listOf("start_packet_capture", "search_packet", "get_packet", "save_packets", "get_db_info", "get_db_schema", "export_packets_har", "get_packet_delta", "get_api_inventory")))
-            assertTrue(toolNames.containsAll(listOf("load_project_config", "get_project_storage", "list_openapi_specs", "get_openapi_spec", "validate_openapi_spec")))
+            assertTrue(toolNames.containsAll(listOf("load_project_config", "get_project_storage", "list_openapi_specs", "get_openapi_spec", "validate_openapi_spec", "list_endpoint_tags", "set_endpoint_tag", "get_endpoint_tag_history")))
             assertFalse(toolNames.contains("send_http1_request"))
             assertFalse(toolNames.contains("send_http2_request"))
             assertFalse(toolNames.contains("put_openapi_spec"))
@@ -208,5 +208,49 @@ class McpServerIntegrationTest {
             status.getValue("openapiDir").jsonPrimitive.content)
         assertEquals(project.toRealPath().resolve("packets.sqlite3").toString(),
             status.getValue("databasePath").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `endpoint tag tools require exact spec and server and preserve history`(@TempDir project: Path) = runBlocking {
+        client.connectToServer("http://127.0.0.1:${testPort}")
+        val started = client.callTool("start_packet_capture", mapOf("projectPath" to project.toString()))
+        assertFalse(started?.isError ?: true)
+        val specDir = Files.createDirectories(project.resolve("raw/resources/mcp-server/openapi"))
+        Files.writeString(specDir.resolve("example.com--https--443.yaml"), """
+            openapi: 3.0.3
+            info: {title: Test, version: '1'}
+            servers:
+              - url: https://example.com/v1
+              - url: https://example.com/v2
+            paths:
+              /items:
+                get:
+                  responses:
+                    '200': {description: OK}
+        """.trimIndent())
+        val base = mapOf("host" to "example.com--https--443", "method" to "GET", "path" to "/items")
+        val missingServer = client.callTool("set_endpoint_tag", base + ("tag" to "VULN"))
+        assertTrue(missingServer?.isError ?: false)
+        val wrongStem = client.callTool("set_endpoint_tag", base + mapOf("host" to "example.com", "serverUrl" to "https://example.com/v1", "tag" to "VULN"))
+        assertTrue(wrongStem?.isError ?: false)
+        val v1 = client.callTool("set_endpoint_tag", base + mapOf("serverUrl" to "https://example.com/v1", "tag" to "VULN"))
+        assertFalse(v1?.isError ?: true)
+        val suspect = client.callTool("set_endpoint_tag", base + mapOf("serverUrl" to "https://example.com/v1", "tag" to "SUSPECT"))
+        assertFalse(suspect?.isError ?: true)
+        val v2 = client.callTool("set_endpoint_tag", base + mapOf("serverUrl" to "https://example.com/v2", "tag" to "SAFE"))
+        assertFalse(v2?.isError ?: true)
+        val list = client.callTool("list_endpoint_tags", mapOf("host" to "example.com--https--443", "serverUrl" to "https://example.com/v1"))
+        assertFalse(list?.isError ?: true)
+        val tags = Json.parseToJsonElement((list!!.content.single() as TextContent).text).jsonArray
+        assertEquals(1, tags.size)
+        assertEquals("SUSPECT", tags.single().jsonObject.getValue("tag").jsonPrimitive.content)
+        val cleared = client.callTool("set_endpoint_tag", base + ("serverUrl" to "https://example.com/v1"))
+        assertFalse(cleared?.isError ?: true)
+        val history = client.callTool("get_endpoint_tag_history", base + ("serverUrl" to "https://example.com/v1"))
+        assertFalse(history?.isError ?: true)
+        val events = Json.parseToJsonElement((history!!.content.single() as TextContent).text).jsonArray
+        assertEquals(3, events.size)
+        assertEquals("SUSPECT", events.first().jsonObject.getValue("oldTag").jsonPrimitive.content)
+        assertEquals("SAFE", Json.parseToJsonElement((client.callTool("list_endpoint_tags", mapOf("host" to "example.com--https--443", "serverUrl" to "https://example.com/v2"))!!.content.single() as TextContent).text).jsonArray.single().jsonObject.getValue("tag").jsonPrimitive.content)
     }
 }

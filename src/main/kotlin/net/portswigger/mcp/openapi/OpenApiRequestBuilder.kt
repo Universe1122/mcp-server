@@ -26,8 +26,12 @@ object OpenApiRequestBuilder {
         document: OpenApiDocument,
         operation: OpenApiOperation,
         parameterValues: Map<String, String> = emptyMap(),
+        serverUrl: String? = null,
     ): RepeaterDraft {
-        val server = (operation.servers + document.servers + "https://${document.info.host}")
+        if (serverUrl != null) require(serverUrl in effectiveServerUrls(document, operation)) {
+            "Selected server is not assigned to this operation"
+        }
+        val server = (listOfNotNull(serverUrl) + operation.servers + document.servers + "https://${document.info.host}")
             .asSequence().mapNotNull { runCatching { URI(it) }.getOrNull() }
             .firstOrNull { it.scheme in listOf("http", "https") && it.host != null &&
                 it.userInfo == null && it.rawQuery == null && it.rawFragment == null }

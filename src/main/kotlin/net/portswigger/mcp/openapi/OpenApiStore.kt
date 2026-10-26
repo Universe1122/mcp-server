@@ -23,6 +23,7 @@ data class OpenApiSpecInfo(
     val operationCount: Int,
     val updatedAt: String,
     val error: String? = null,
+    val servers: List<String> = emptyList(),
 )
 
 @Serializable
@@ -172,9 +173,9 @@ class OpenApiStore(
                     val refs = operation["x-burp-history-refs"] as? List<*>
                     if (refs == null || refs.any { raw ->
                         val pair = raw as? Map<*, *> ?: return@any true
-                        (pair["historyId"]?.toString()?.toIntOrNull() ?: 0) <= 0 ||
+                        (pair["historyId"]?.toString()?.toIntOrNull() ?: -1) < 0 ||
                             (pair["packetId"]?.toString()?.toLongOrNull() ?: 0) <= 0
-                    }) errors += "$label: x-burp-history-refs must contain positive historyId and packetId pairs"
+                    }) errors += "$label: x-burp-history-refs must contain non-negative historyId and positive packetId pairs"
                     if (refs != null && refs.size > 20) warnings += "$label: only the latest 20 History references are displayed"
                 }
                 val parameters = operationParameters(root, pathItem, operation)
@@ -209,9 +210,17 @@ class OpenApiStore(
 
     private fun info(host: String, file: Path, bytes: ByteArray, root: Map<*, *>): OpenApiSpecInfo {
         val metadata = root["info"] as Map<*, *>
+        val rootServers = (root["servers"] as? List<*>)?.mapNotNull { (it as? Map<*, *>)?.get("url")?.toString() }
+            ?: emptyList()
+        val operations = operations(root)
+        val effectiveServers = operations.flatMap { operation ->
+            operation.servers.ifEmpty { rootServers }.mapNotNull { parseOpenApiServer(host, it)?.url }
+                .ifEmpty { listOf("https://$host") }
+        }
         return OpenApiSpecInfo(host, file.toString(), sha256(bytes), metadata["title"]?.toString(),
-            metadata["version"]?.toString(), operations(root).size,
-            Files.getLastModifiedTime(file).toInstant().toString())
+            metadata["version"]?.toString(), operations.size,
+            Files.getLastModifiedTime(file).toInstant().toString(),
+            servers = effectiveServers.ifEmpty { rootServers.ifEmpty { listOf("https://$host") } }.distinct())
     }
 
     private fun operations(root: Map<*, *>): List<OpenApiOperation> {
@@ -232,7 +241,7 @@ class OpenApiStore(
                     operation["responses"] as? Map<*, *> ?: emptyMap<Any, Any>(),
                     (operation["x-burp-history-refs"] as? List<*>)?.mapNotNull { raw ->
                         val ref = raw as? Map<*, *> ?: return@mapNotNull null
-                        val historyId = ref["historyId"]?.toString()?.toIntOrNull()?.takeIf { it > 0 }
+                        val historyId = ref["historyId"]?.toString()?.toIntOrNull()?.takeIf { it >= 0 }
                         val packetId = ref["packetId"]?.toString()?.toLongOrNull()?.takeIf { it > 0 }
                         if (historyId != null && packetId != null) OpenApiHistoryRef(historyId, packetId) else null
                     } ?: emptyList(),
@@ -270,7 +279,7 @@ class OpenApiStore(
     }
     private fun directory(): Path? = configuredDirectory() ?: projectDirectory()?.resolve(SPEC_DIRECTORY)
     private fun normalizeHost(host: String): String = host.trim().lowercase().also {
-        require(HOST_PATTERN.matches(it) && ".." !in it) { "host must be a DNS hostname without a port or path" }
+        require(HOST_PATTERN.matches(it) && ".." !in it) { "spec key must use hostname-safe characters without a colon or path" }
     }
 
     private fun readBytes(file: Path): ByteArray {

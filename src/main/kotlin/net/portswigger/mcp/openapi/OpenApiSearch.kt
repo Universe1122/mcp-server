@@ -26,8 +26,10 @@ internal fun matchesOpenApiSearch(operation: OpenApiOperation, inspectionTag: St
 }
 
 /** Select the most specific documented route when templates overlap. */
-internal fun matchingOpenApiOperation(operations: List<OpenApiOperation>, method: String, url: String): OpenApiOperation? {
-    val actual = runCatching { URI(url).path.split('/') }.getOrNull() ?: return null
+internal fun matchingOpenApiOperation(operations: List<OpenApiOperation>, method: String, url: String,
+                                      server: OpenApiServer? = null): OpenApiOperation? {
+    val actual = (if (server == null) runCatching { URI(url).path }.getOrNull()
+                  else operationPathForServer(url, server))?.split('/') ?: return null
     return operations.asSequence().filter { it.method.equals(method, ignoreCase = true) }
         .filter { operation ->
             val template = operation.path.split('/')

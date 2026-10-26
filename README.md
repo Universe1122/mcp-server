@@ -197,12 +197,15 @@ spec, writes OpenAPI 3.x YAML, and saves `<host>.yaml` directly in the folder se
 `storage.openapi_dir` in the project's `config.yaml`. The Burp **MCP → Swagger** tab lists those files by
 host, shows a read-only Swagger-style API explorer, and reloads changed files. Click anywhere on an
 operation row to expand its description, source Burp History IDs, parameters, request body, response
-examples, and schemas. The viewer has White and Dark themes, and the expanded detail scrolls with
-the main page even when the pointer is over a parameter or response example. Search filters paths,
+examples, and schemas in the endpoint column. The left column lists the concrete OpenAPI servers,
+including protocol and port, across the available spec files. Selecting a source packet opens its
+detail on the right; Esc or the X button closes it. The viewer
+has White and Dark themes. Search filters paths,
 methods, summaries, descriptions, parameters, related schema fields, inspection badges, and operation IDs.
 Enable **Include packets** to search the selected host's saved URLs, request/response headers, and indexed
 text bodies. Matching packets are grouped under documented endpoints with short excerpts and links to the
-stored packet detail; use **Load more packet matches** to page through older results. Body search covers
+stored packet detail. Packet searches, History references, and response examples are limited to the
+selected protocol, host, and port; use **Load more packet matches** to page through older results. Body search covers
 the indexed text prefix, while binary bodies are not searchable. Schema
 trees resolve local `#/components/schemas/` references with a recursion limit. **Send to Repeater**
 creates an editable request tab from the documented server, path, required parameters,
@@ -212,16 +215,31 @@ response without a documented example, the viewer shows a bounded actual respons
 History reference when available. Review values before sending. Creating the tab does not
 transmit the request. The Swing viewer works without a browser engine.
 
-An endpoint can carry a `VULN` or `SAFE` inspection badge next to its path. Right-click its row
-to set or clear the badge. Agents use `list_endpoint_tags` and `set_endpoint_tag` for the same
-records. These records are kept in the connected packet database by host, method, and exact
-OpenAPI path, so rewriting the YAML does not erase them. Untagged means unreviewed; `VULN`
-denotes a confirmed finding, while `SAFE` means no issue was identified during the review.
+An OpenAPI file can list several `servers` when they expose the same operations. Path or operation
+`servers` overrides are respected: an endpoint appears only under its effective servers. When the
+same method and path have different behavior on different ports, use separate spec files rather than
+merging their definitions. A portable filename for a port-specific variant is
+`www.naver.com--https--12345.yaml`; give it an explicit `servers: [{url: "https://www.naver.com:12345"}]`
+and use the filename stem as the `host` argument of the OpenAPI MCP tools. Server URLs must be
+absolute HTTP(S) URLs for this viewer.
+
+An endpoint can carry a `VULN`, `SUSPECT`, or `SAFE` inspection badge next to its path. Right-click its row
+to set or clear the badge. Agents use `list_endpoint_tags` and `set_endpoint_tag` with `serverUrl`
+for the same records. Use the exact YAML filename stem for `host` and the operation's effective
+server URL, including any base path, for `serverUrl`. These records are kept in the connected packet
+database by spec stem, full server URL, method, and exact OpenAPI path, so rewriting the YAML does
+not erase them. Existing origin-only tags remain attached to that root server and are not
+automatically assigned to a base-path server; legacy host-wide tags remain available for review
+but are not assigned automatically. Right-click **Tag history** or call `get_endpoint_tag_history`
+to see changes and clears. Untagged means unreviewed; `VULN` denotes a confirmed finding,
+`SUSPECT` marks a potential issue awaiting verification, and `SAFE` means no issue was identified
+during the review.
 
 Put representative Burp Proxy HTTP History references on each OpenAPI operation as
 `x-burp-history-refs: [{historyId: 203, packetId: 278}]`. Resolve pairs through
 `packet_history_refs`. The viewer labels buttons with History numbers; the packet ID disambiguates
-History numbers reused after a Burp project restart. Include at most 20 verified pairs, newest
+History numbers reused after a Burp project restart. Burp may assign `historyId: 0` to the first
+request; it is a valid reference. Include at most 20 verified pairs, newest
 saved packets first, while covering different response codes or message shapes. The viewer displays
 no more than 20 History buttons and opens the corresponding stored request and response. The bundled OpenAPI
 methodology also directs agents to exclude static resources, write descriptions in Korean, leave

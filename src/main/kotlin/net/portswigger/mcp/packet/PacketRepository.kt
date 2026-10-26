@@ -86,6 +86,8 @@ data class SwaggerPacketSearchHit(
     val historyId: Int?,
     val method: String,
     val url: String,
+    val port: Int,
+    val usesHttps: Boolean,
     val statusCode: Int?,
     val location: String,
     val snippet: String,
@@ -153,6 +155,20 @@ data class EndpointInspectionTag(
     val method: String,
     val path: String,
     val tag: String,
+    val source: String,
+    val updatedAt: String,
+    val serverUrl: String = "",
+)
+
+@Serializable
+data class EndpointTagChange(
+    val id: Long,
+    val host: String,
+    val serverUrl: String,
+    val method: String,
+    val path: String,
+    val oldTag: String?,
+    val newTag: String?,
     val source: String,
     val updatedAt: String,
 )
@@ -369,16 +385,19 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
     fun inspectionTagRevision(): Long = inspectionTagRevision.get()
 
     @Synchronized
-    fun endpointInspectionTags(host: String): List<EndpointInspectionTag> {
+    fun endpointInspectionTags(host: String, serverUrl: String? = null): List<EndpointInspectionTag> {
         val normalizedHost = normalizeTagHost(host)
+        val normalizedUrl = serverUrl?.let(::normalizeTagServerUrl)
         val db = requireDb()
-        db.prepareStatement("SELECT host,method,path,tag,source,updated_at FROM endpoint_inspection_tags WHERE host=? ORDER BY method,path").use { st ->
+        db.prepareStatement("SELECT host,method,path,tag,source,updated_at,server_url FROM endpoint_inspection_tags WHERE host=? AND (? IS NULL OR server_url=?) ORDER BY server_url,method,path").use { st ->
             st.setString(1, normalizedHost)
+            st.setString(2, normalizedUrl)
+            st.setString(3, normalizedUrl)
             st.executeQuery().use { rows ->
                 return buildList {
                     while (rows.next()) add(EndpointInspectionTag(
                         rows.getString("host"), rows.getString("method"), rows.getString("path"),
-                        rows.getString("tag"), rows.getString("source"), rows.getString("updated_at"),
+                        rows.getString("tag"), rows.getString("source"), rows.getString("updated_at"), rows.getString("server_url"),
                     ))
                 }
             }
@@ -386,33 +405,81 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
     }
 
     @Synchronized
-    fun setEndpointInspectionTag(host: String, method: String, path: String, tag: String?, source: String): EndpointInspectionTag? {
+    fun setEndpointInspectionTag(host: String, method: String, path: String, tag: String?, source: String,
+                                 serverUrl: String): EndpointInspectionTag? {
         val normalizedHost = normalizeTagHost(host)
+        val normalizedUrl = normalizeTagServerUrl(serverUrl)
         val normalizedMethod = method.uppercase()
         require(normalizedMethod in setOf("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE")) { "Unsupported HTTP method" }
         require(path.startsWith('/') && path.length <= 2048 && path.none { it.isWhitespace() || it.isISOControl() }) { "Invalid OpenAPI path" }
-        require(tag == null || tag == "VULN" || tag == "SAFE") { "tag must be VULN, SAFE, or null to clear" }
+        require(tag == null || tag in setOf("VULN", "SUSPECT", "SAFE")) { "tag must be VULN, SUSPECT, SAFE, or null to clear" }
         require(source == "agent" || source == "human") { "Invalid tag source" }
         val db = requireDb()
-        if (tag == null) {
-            db.prepareStatement("DELETE FROM endpoint_inspection_tags WHERE host=? AND method=? AND path=?").use { st ->
-                st.setString(1, normalizedHost); st.setString(2, normalizedMethod); st.setString(3, path)
+        val updatedAt = Instant.now().toString()
+        db.autoCommit = false
+        try {
+            val previous = db.prepareStatement("SELECT tag FROM endpoint_inspection_tags WHERE host=? AND server_url=? AND method=? AND path=?").use { st ->
+                st.setString(1, normalizedHost); st.setString(2, normalizedUrl)
+                st.setString(3, normalizedMethod); st.setString(4, path)
+                st.executeQuery().use { rows -> if (rows.next()) rows.getString(1) else null }
+            }
+            if (tag == null) {
+                if (previous != null) db.prepareStatement("DELETE FROM endpoint_inspection_tags WHERE host=? AND server_url=? AND method=? AND path=?").use { st ->
+                    st.setString(1, normalizedHost); st.setString(2, normalizedUrl)
+                    st.setString(3, normalizedMethod); st.setString(4, path)
+                    st.executeUpdate()
+                }
+            } else db.prepareStatement("""
+                INSERT INTO endpoint_inspection_tags(host,server_url,method,path,tag,source,updated_at) VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(host,server_url,method,path) DO UPDATE SET tag=excluded.tag,source=excluded.source,updated_at=excluded.updated_at
+            """).use { st ->
+                st.setString(1, normalizedHost); st.setString(2, normalizedUrl)
+                st.setString(3, normalizedMethod); st.setString(4, path)
+                st.setString(5, tag); st.setString(6, source); st.setString(7, updatedAt)
                 st.executeUpdate()
             }
-            inspectionTagRevision.incrementAndGet()
-            return null
+            if (tag != null || previous != null) db.prepareStatement("""
+                INSERT INTO endpoint_inspection_tag_events(host,server_url,method,path,old_tag,new_tag,source,updated_at)
+                VALUES(?,?,?,?,?,?,?,?)
+            """).use { st ->
+                st.setString(1, normalizedHost); st.setString(2, normalizedUrl)
+                st.setString(3, normalizedMethod); st.setString(4, path)
+                st.setString(5, previous); st.setString(6, tag)
+                st.setString(7, source); st.setString(8, updatedAt)
+                st.executeUpdate()
+            }
+            db.commit()
+            if (tag != null || previous != null) inspectionTagRevision.incrementAndGet()
+        } catch (error: Exception) {
+            db.rollback()
+            throw error
+        } finally {
+            db.autoCommit = true
         }
-        val updatedAt = Instant.now().toString()
+        return tag?.let { EndpointInspectionTag(normalizedHost, normalizedMethod, path, it, source, updatedAt, normalizedUrl) }
+    }
+
+    @Synchronized
+    fun endpointTagHistory(host: String, serverUrl: String, method: String, path: String, limit: Int = 50): List<EndpointTagChange> {
+        val normalizedHost = normalizeTagHost(host)
+        val normalizedUrl = normalizeTagServerUrl(serverUrl)
+        require(limit in 1..200) { "limit must be between 1 and 200" }
+        val db = requireDb()
         db.prepareStatement("""
-            INSERT INTO endpoint_inspection_tags(host,method,path,tag,source,updated_at) VALUES(?,?,?,?,?,?)
-            ON CONFLICT(host,method,path) DO UPDATE SET tag=excluded.tag,source=excluded.source,updated_at=excluded.updated_at
+            SELECT id,host,server_url,method,path,old_tag,new_tag,source,updated_at
+            FROM endpoint_inspection_tag_events
+            WHERE host=? AND server_url=? AND method=? AND path=? ORDER BY id DESC LIMIT ?
         """).use { st ->
-            st.setString(1, normalizedHost); st.setString(2, normalizedMethod); st.setString(3, path)
-            st.setString(4, tag); st.setString(5, source); st.setString(6, updatedAt)
-            st.executeUpdate()
+            st.setString(1, normalizedHost); st.setString(2, normalizedUrl)
+            st.setString(3, method.uppercase()); st.setString(4, path); st.setInt(5, limit)
+            st.executeQuery().use { rows -> return buildList {
+                while (rows.next()) add(EndpointTagChange(
+                    rows.getLong("id"), rows.getString("host"), rows.getString("server_url"),
+                    rows.getString("method"), rows.getString("path"), rows.getString("old_tag"),
+                    rows.getString("new_tag"), rows.getString("source"), rows.getString("updated_at"),
+                ))
+            } }
         }
-        inspectionTagRevision.incrementAndGet()
-        return EndpointInspectionTag(normalizedHost, normalizedMethod, path, tag, source, updatedAt)
     }
 
     @Synchronized
@@ -428,7 +495,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         val db = connection ?: return DatabaseInfo(status(), emptyMap())
         val tables = listOf(
             "burp_packets", "packet_blobs", "packet_body_fts",
-            "packet_history_refs", "api_route_summary", "api_route_status_codes", "packet_changes", "endpoint_inspection_tags",
+            "packet_history_refs", "api_route_summary", "api_route_status_codes", "packet_changes", "endpoint_inspection_tags", "endpoint_inspection_tag_events",
         ).associateWith { name ->
             db.createStatement().use { st ->
                 st.executeQuery("PRAGMA table_info($name)").use { rs ->
@@ -446,7 +513,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
         db.prepareStatement("""
             SELECT name, sql FROM sqlite_master
             WHERE type='table' AND name IN
-              ('burp_packets','packet_blobs','packet_body_fts','api_route_summary','api_route_status_codes','packet_changes','endpoint_inspection_tags')
+              ('burp_packets','packet_blobs','packet_body_fts','api_route_summary','api_route_status_codes','packet_changes','endpoint_inspection_tags','endpoint_inspection_tag_events')
             ORDER BY name
         """).use { st ->
             st.executeQuery().use { rs -> while (rs.next()) statements[rs.getString("name")] = rs.getString("sql") }
@@ -510,7 +577,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
 
     @Synchronized
     fun getPacketByHistoryId(historyId: Int, packetId: Long, maxBodyBytes: Int = 65_536): PacketDetail? {
-        require(historyId > 0) { "historyId must be positive" }
+        require(historyId >= 0) { "historyId must be non-negative" }
         require(packetId > 0) { "packetId must be positive" }
         val db = requireDb()
         val linked = db.prepareStatement("SELECT 1 FROM packet_history_refs WHERE history_id=? AND packet_id=?").use { st ->
@@ -531,6 +598,10 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             }
         }
     }
+
+    @Synchronized
+    fun hostRelationshipGraph(sampleLimit: Int = 5_000): HostGraphSnapshot? =
+        connection?.let { readHostRelationshipGraph(it, sampleLimit) }
 
     /** Cheap change marker for the all-packets inventory shown in the Burp tab. */
     @Synchronized
@@ -728,10 +799,11 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
 
     /** Bounded, newest-first literal search for the Swagger viewer. Bodies use the shared FTS index. */
     fun searchSwaggerPackets(host: String, query: String, beforeId: Long = Long.MAX_VALUE,
-                             limit: Int = 100): SwaggerPacketSearchPage {
+                             limit: Int = 100, port: Int? = null, usesHttps: Boolean? = null): SwaggerPacketSearchPage {
         require(host.isNotBlank()) { "host is required" }
         require(query.length in 3..200) { "query length must be between 3 and 200" }
         require(beforeId > 0 && limit in 1..200) { "Invalid search page" }
+        require(port == null || port in 1..65535) { "Invalid port" }
         val literal = query.lowercase()
         val ftsPhrase = "\"${query.replace("\"", "\"\"")}\""
         val sql = """
@@ -740,7 +812,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 FROM packet_body_fts JOIN packet_blobs b ON b.rowid=packet_body_fts.rowid
                 WHERE packet_body_fts MATCH ?
             )
-            SELECT p.id,p.method,p.url,p.status_code,p.request_head,p.response_head,
+            SELECT p.id,p.method,p.url,p.port,p.uses_https,p.status_code,p.request_head,p.response_head,
                    (SELECT MAX(r.history_id) FROM packet_history_refs r WHERE r.packet_id=p.id) AS history_id,
                    CASE WHEN instr(lower(p.url),?)>0 THEN 'URL'
                         WHEN instr(lower(CAST(p.request_head AS TEXT)),?)>0 THEN 'Request headers'
@@ -754,7 +826,7 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             FROM burp_packets p
             LEFT JOIN body_hits req ON req.hash=p.request_body_hash
             LEFT JOIN body_hits res ON res.hash=p.response_body_hash
-            WHERE p.host=? AND p.id<? AND (
+            WHERE p.host=? AND p.id<? AND (? IS NULL OR p.port=?) AND (? IS NULL OR p.uses_https=?) AND (
                 instr(lower(p.url),?)>0 OR
                 instr(lower(CAST(p.request_head AS TEXT)),?)>0 OR
                 instr(lower(CAST(p.response_head AS TEXT)),?)>0 OR
@@ -772,10 +844,14 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 st.setString(5, literal)
                 st.setString(6, host.lowercase())
                 st.setLong(7, beforeId)
-                st.setString(8, literal)
-                st.setString(9, literal)
-                st.setString(10, literal)
-                st.setInt(11, limit + 1)
+                if (port == null) st.setNull(8, java.sql.Types.INTEGER) else st.setInt(8, port)
+                if (port == null) st.setNull(9, java.sql.Types.INTEGER) else st.setInt(9, port)
+                if (usesHttps == null) st.setNull(10, java.sql.Types.INTEGER) else st.setInt(10, if (usesHttps) 1 else 0)
+                if (usesHttps == null) st.setNull(11, java.sql.Types.INTEGER) else st.setInt(11, if (usesHttps) 1 else 0)
+                st.setString(12, literal)
+                st.setString(13, literal)
+                st.setString(14, literal)
+                st.setInt(15, limit + 1)
                 st.executeQuery().use { rows ->
                     val found = buildList {
                         while (rows.next()) {
@@ -788,7 +864,8 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                                 else -> rows.getString("excerpt") ?: ""
                             }
                             add(SwaggerPacketSearchHit(rows.getLong("id"), historyId, rows.getString("method"),
-                                rows.getString("url"), statusCode, location, excerpt))
+                                rows.getString("url"), rows.getInt("port"), rows.getInt("uses_https") != 0,
+                                statusCode, location, excerpt))
                         }
                     }
                     val hasMore = found.size > limit
@@ -796,6 +873,26 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                     return SwaggerPacketSearchPage(page, hasMore,
                         if (hasMore) page.lastOrNull()?.packetId else null)
                 }
+            }
+        }
+    }
+
+    /** Resolve a bounded set of stored references on the selected HTTP origin without loading bodies. */
+    fun packetUrlsForServer(packetIds: List<Long>, host: String, port: Int, usesHttps: Boolean): Map<Long, String> {
+        if (packetIds.isEmpty()) return emptyMap()
+        require(packetIds.size <= 100 && packetIds.all { it > 0 }) { "Invalid packet references" }
+        require(port in 1..65535) { "Invalid port" }
+        val placeholders = packetIds.joinToString(",") { "?" }
+        val sql = "SELECT id,url FROM burp_packets WHERE id IN ($placeholders) AND host=? AND port=? AND uses_https=?"
+        openReader().use { reader ->
+            reader.prepareStatement(sql).use { st ->
+                packetIds.forEachIndexed { index, id -> st.setLong(index + 1, id) }
+                st.setString(packetIds.size + 1, host.lowercase())
+                st.setInt(packetIds.size + 2, port)
+                st.setInt(packetIds.size + 3, if (usesHttps) 1 else 0)
+                st.executeQuery().use { rows -> return buildMap {
+                    while (rows.next()) put(rows.getLong("id"), rows.getString("url"))
+                } }
             }
         }
     }
@@ -1383,15 +1480,6 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
             st.execute("INSERT OR IGNORE INTO packet_history_refs(history_id,packet_id) SELECT burp_id,id FROM burp_packets WHERE burp_id IS NOT NULL")
             st.execute("CREATE VIRTUAL TABLE IF NOT EXISTS packet_body_fts USING fts5(body_text,tokenize='trigram')")
             st.execute("CREATE TABLE IF NOT EXISTS capture_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
-            st.execute("""
-                CREATE TABLE IF NOT EXISTS endpoint_inspection_tags(
-                    host TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,
-                    tag TEXT NOT NULL CHECK(tag IN ('VULN','SAFE')),
-                    source TEXT NOT NULL CHECK(source IN ('agent','human')),
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY(host,method,path)
-                )
-            """)
             // The former Python collector left this INSERT trigger on some databases after
             // their packet table was migrated. It references columns absent from this schema
             // and makes every new Proxy response fail to save.
@@ -1401,8 +1489,68 @@ class PacketRepository(private val api: MontoyaApi) : AutoCloseable {
                 insert.executeUpdate()
             }
         }
+        initializeTagSchema(db)
         initializeInventory(db)
         initializePacketChanges(db)
+    }
+
+    private fun initializeTagSchema(db: Connection) {
+        db.autoCommit = false
+        try {
+            db.createStatement().use { st ->
+                fun columns(table: String): Set<String> = st.executeQuery("PRAGMA table_info($table)").use { rows ->
+                    buildSet { while (rows.next()) add(rows.getString("name")) }
+                }
+                val oldColumns = columns("endpoint_inspection_tags")
+                val tagTableSql = st.executeQuery("SELECT sql FROM sqlite_master WHERE type='table' AND name='endpoint_inspection_tags'").use { rows ->
+                    if (rows.next()) rows.getString(1) else null
+                }
+                if (oldColumns.isNotEmpty() && ("server_url" !in oldColumns || "'SUSPECT'" !in tagTableSql.orEmpty())) {
+                    st.execute("ALTER TABLE endpoint_inspection_tags RENAME TO endpoint_inspection_tags_legacy")
+                }
+                st.execute("""
+                    CREATE TABLE IF NOT EXISTS endpoint_inspection_tags(
+                        host TEXT NOT NULL,server_url TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,
+                        tag TEXT NOT NULL CHECK(tag IN ('VULN','SUSPECT','SAFE')),
+                        source TEXT NOT NULL CHECK(source IN ('agent','human')),
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(host,server_url,method,path)
+                    )
+                """)
+                val legacyColumns = columns("endpoint_inspection_tags_legacy")
+                if (legacyColumns.isNotEmpty()) {
+                    val urlColumn = when {
+                        "server_url" in legacyColumns -> "server_url"
+                        "server_origin" in legacyColumns -> "server_origin"
+                        else -> "''"
+                    }
+                    st.execute("""
+                        INSERT OR IGNORE INTO endpoint_inspection_tags(host,server_url,method,path,tag,source,updated_at)
+                        SELECT host,$urlColumn,method,path,tag,source,updated_at FROM endpoint_inspection_tags_legacy
+                    """)
+                    st.execute("DROP TABLE endpoint_inspection_tags_legacy")
+                }
+                val hasEvents = columns("endpoint_inspection_tag_events").isNotEmpty()
+                st.execute("""
+                    CREATE TABLE IF NOT EXISTS endpoint_inspection_tag_events(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        host TEXT NOT NULL,server_url TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,
+                        old_tag TEXT,new_tag TEXT,source TEXT NOT NULL,updated_at TEXT NOT NULL
+                    )
+                """)
+                st.execute("CREATE INDEX IF NOT EXISTS idx_tag_events_key ON endpoint_inspection_tag_events(host,server_url,method,path,id DESC)")
+                if (!hasEvents) st.execute("""
+                    INSERT INTO endpoint_inspection_tag_events(host,server_url,method,path,old_tag,new_tag,source,updated_at)
+                    SELECT host,server_url,method,path,NULL,tag,source,updated_at FROM endpoint_inspection_tags
+                """)
+            }
+            db.commit()
+        } catch (error: Exception) {
+            db.rollback()
+            throw error
+        } finally {
+            db.autoCommit = true
+        }
     }
 
     private fun saveHistoryReference(db: Connection, historyId: Int, packetId: Long) {
@@ -1418,6 +1566,18 @@ private fun normalizeTagHost(host: String): String {
     val normalized = host.trim().lowercase()
     require(normalized.length in 1..253 && normalized.matches(Regex("[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?"))) { "Invalid host" }
     return normalized
+}
+
+private fun normalizeTagServerUrl(serverUrl: String): String {
+    val uri = runCatching { java.net.URI(serverUrl.trim()) }.getOrNull()
+        ?: throw IllegalArgumentException("Invalid serverUrl")
+    val scheme = uri.scheme?.lowercase()
+    require(scheme in setOf("http", "https") && uri.host != null && uri.userInfo == null &&
+        uri.rawQuery == null && uri.rawFragment == null) { "Invalid serverUrl" }
+    require(uri.port == -1 || uri.port in 1..65535) { "Invalid serverUrl port" }
+    val port = uri.port.takeIf { it in 1..65535 } ?: if (scheme == "https") 443 else 80
+    val basePath = uri.path.orEmpty().trimEnd('/')
+    return "$scheme://${uri.host.lowercase()}:$port$basePath"
 }
 
 private fun ResultSet.intOrNull(column: String): Int? = getInt(column).let { if (wasNull()) null else it }

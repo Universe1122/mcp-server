@@ -20,6 +20,7 @@ class OpenApiStoreTest {
         assertEquals("GET", store.load("cafe.naver.com").operations.single().method)
         assertTrue(store.load("cafe.naver.com").operations.single().details.contains("Responses"))
         assertEquals("https://cafe.naver.com", store.load("cafe.naver.com").servers.single())
+        assertEquals(listOf("https://cafe.naver.com"), first.servers)
         val operation = store.load("cafe.naver.com").operations.single()
         assertEquals(listOf(OpenApiHistoryRef(42, 100), OpenApiHistoryRef(17, 101)), operation.historyRefs)
         assertEquals("id", operation.parameters.single()["name"])
@@ -52,6 +53,52 @@ class OpenApiStoreTest {
         assertNotNull(store.list().single().error)
         assertFalse(store.validate("cafe.naver.com").valid)
         assertFalse(store.validate("missing.example").valid)
+    }
+
+    @Test
+    fun `discovers port specific servers and operation overrides`(@TempDir project: Path) {
+        val directory = Files.createDirectories(project.resolve("raw/resources/mcp-server/openapi"))
+        Files.writeString(directory.resolve("www.naver.com.yaml"), """
+            openapi: 3.0.3
+            info:
+              title: Multi-port API
+              version: '1'
+            servers:
+              - url: https://www.naver.com
+              - url: https://www.naver.com:12345
+            paths:
+              /shared:
+                get:
+                  responses:
+                    '200': {description: OK}
+              /special:
+                get:
+                  servers:
+                    - url: https://www.naver.com:12345
+                  responses:
+                    '200': {description: OK}
+        """.trimIndent())
+        val store = OpenApiStore({ project })
+        assertEquals(listOf("https://www.naver.com", "https://www.naver.com:12345"), store.list().single().servers)
+        val document = store.load("www.naver.com")
+        val defaultServer = documentServers(document).single { it.port == 443 }
+        val alternate = documentServers(document).single { it.port == 12345 }
+        assertTrue(supportsServer(document, document.operations.single { it.path == "/shared" }, defaultServer))
+        assertFalse(supportsServer(document, document.operations.single { it.path == "/special" }, defaultServer))
+        assertTrue(supportsServer(document, document.operations.single { it.path == "/special" }, alternate))
+        Files.writeString(directory.resolve("www.naver.com--https--12345.yaml"), """
+            openapi: 3.0.3
+            info: {title: Alternate API, version: '1'}
+            servers:
+              - url: https://www.naver.com:12345
+            paths:
+              /separate:
+                get:
+                  responses:
+                    '200': {description: OK}
+        """.trimIndent())
+        val variant = store.list().single { it.host == "www.naver.com--https--12345" }
+        assertEquals(listOf("https://www.naver.com:12345"), variant.servers)
     }
 
     @Test
@@ -92,6 +139,24 @@ class OpenApiStoreTest {
         val report = OpenApiStore({ project }).validate("example.com")
         assertFalse(report.valid)
         assertTrue(report.errors.any { "x-burp-history-refs" in it })
+    }
+
+    @Test
+    fun `history reference zero is valid and retained`(@TempDir project: Path) {
+        val directory = Files.createDirectories(project.resolve("raw/resources/mcp-server/openapi"))
+        Files.writeString(directory.resolve("example.com.yaml"), """
+            openapi: 3.0.3
+            info: {title: First Burp request, version: '1'}
+            paths:
+              /first:
+                get:
+                  x-burp-history-refs: [{historyId: 0, packetId: 1}]
+                  responses:
+                    '200': {description: OK}
+        """.trimIndent())
+        val store = OpenApiStore({ project })
+        assertTrue(store.validate("example.com").valid)
+        assertEquals(OpenApiHistoryRef(0, 1), store.load("example.com").operations.single().historyRefs.single())
     }
 
     @Test
