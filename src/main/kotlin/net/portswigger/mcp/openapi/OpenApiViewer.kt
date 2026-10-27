@@ -72,6 +72,9 @@ class OpenApiViewer(
     private val projectLabel = JLabel("Connect a packet project with start_packet_capture")
     private val serverModel = DefaultListModel<OpenApiServer>()
     private val serverList = JList(serverModel)
+    private val serverSearch = JTextField()
+    private val serverSearchStatus = JLabel("0 servers")
+    private var allServers = emptyList<OpenApiServer>()
     private val search = JTextField(24)
     private val includePackets = JCheckBox("Include packets")
     private val searchStatus = JLabel()
@@ -212,9 +215,25 @@ class OpenApiViewer(
         }
         serverList.selectionMode = javax.swing.ListSelectionModel.SINGLE_SELECTION
         serverList.accessibleContext.accessibleName = "OpenAPI servers"
+        serverSearch.apply {
+            toolTipText = "Filter servers by hostname, port, or URL"
+            accessibleContext.accessibleName = "Search hosts or ports"
+        }
         val serverPane = JPanel(BorderLayout(0, 8)).apply {
             border = BorderFactory.createEmptyBorder(8, 4, 8, 6)
-            add(JLabel("Servers"), BorderLayout.NORTH)
+            add(JPanel(BorderLayout(0, 6)).apply {
+                add(JLabel("Search hosts / ports").apply { labelFor = serverSearch }, BorderLayout.NORTH)
+                add(JPanel(BorderLayout(4, 0)).apply {
+                    add(serverSearch, BorderLayout.CENTER)
+                    add(JButton("×").apply {
+                        toolTipText = "Clear server search"
+                        accessibleContext.accessibleName = "Clear server search"
+                        margin = Insets(2, 6, 2, 6)
+                        addActionListener { serverSearch.text = ""; serverSearch.requestFocusInWindow() }
+                    }, BorderLayout.EAST)
+                }, BorderLayout.CENTER)
+                add(serverSearchStatus, BorderLayout.SOUTH)
+            }, BorderLayout.NORTH)
             add(JScrollPane(serverList).apply {
                 horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
             }, BorderLayout.CENTER)
@@ -253,6 +272,11 @@ class OpenApiViewer(
                 }
             }
         }
+        serverSearch.document.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(event: DocumentEvent) = filterServers()
+            override fun removeUpdate(event: DocumentEvent) = filterServers()
+            override fun changedUpdate(event: DocumentEvent) = filterServers()
+        })
         search.document.addDocumentListener(object : DocumentListener {
             override fun insertUpdate(event: DocumentEvent) = schedulePacketSearch()
             override fun removeUpdate(event: DocumentEvent) = schedulePacketSearch()
@@ -280,6 +304,9 @@ class OpenApiViewer(
         viewerScroll.viewport.background = pageColor
         serverList.background = pageColor
         serverList.foreground = ink
+        serverSearch.background = palette.field
+        serverSearch.foreground = ink
+        serverSearch.caretColor = ink
         packetPanel.setDarkTheme(darkTheme.isSelected)
         renderOperations()
     }
@@ -335,12 +362,9 @@ class OpenApiViewer(
             snapshot.tagRevision).joinToString("|")
         if (signature == newSignature) return
         signature = newSignature
-        updatingServers = true
-        serverModel.clear()
-        snapshot.servers.forEach(serverModel::addElement)
+        allServers = snapshot.servers
         selectedServer = snapshot.selectedServer
-        serverList.selectedIndex = snapshot.servers.indexOf(snapshot.selectedServer)
-        updatingServers = false
+        filterServers()
         document = snapshot.document
         inspectionTags = snapshot.tags.associateBy { "${it.method} ${it.path}" }
         if (documentChanged) schedulePacketSearch()
@@ -362,6 +386,28 @@ class OpenApiViewer(
         } ?: "Select a host with an OpenAPI document."
         description.rows = description.text.lines().size.coerceIn(1, 5)
         renderOperations()
+    }
+
+    private fun filterServers() {
+        val term = serverSearch.text.trim()
+        val visible = allServers.filter {
+            term.isEmpty() || it.url.contains(term, ignoreCase = true) ||
+                it.canonicalUrl.contains(term, ignoreCase = true)
+        }
+        // Filtering only changes the list; keep the open endpoint and packet detail intact.
+        updatingServers = true
+        try {
+            serverModel.clear()
+            visible.forEach(serverModel::addElement)
+            serverList.selectedIndex = visible.indexOf(selectedServer)
+        } finally {
+            updatingServers = false
+        }
+        serverSearchStatus.text = when {
+            term.isEmpty() -> "${allServers.size} servers"
+            visible.isEmpty() -> "No matching servers (0 / ${allServers.size})"
+            else -> "${visible.size} / ${allServers.size} servers"
+        }
     }
 
     private fun renderOperations() {
